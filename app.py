@@ -1530,94 +1530,182 @@ def load_data(cfg: Config = CFG) -> dict:
 # ============================================================================
 
 def run_master_logistics_optimizer(order_file="output_orders/DIM_ORDERS.xlsx",
-                                     vehicle_file="output_fleet/DIM_VEHICLE.xlsx",
-                                     matrix_file="output_matrix/DISTANCE_MATRIX_KM.xlsx"):
+                                   vehicle_file="output_fleet/DIM_VEHICLE.xlsx",
+                                   matrix_file="output_matrix/DISTANCE_MATRIX_KM.xlsx"):
     """
-    HÀM TỔNG MASTER: Quét đơn hàng -> Lọc đội xe -> Tách đơn quá cỡ -> Đọc ma trận -> Sẵn sàng chạy Clarke-Wright.
+    HÀM TỔNG MASTER:
+    Quét đơn hàng -> Xác định xe khả thi theo TRỌNG LƯỢNG + THỂ TÍCH
+    -> Không loại đơn chỉ vì vượt xe lớn nhất
+    -> Để Clarke-Wright lập tuyến trước
+    -> Sau khi có tuyến mới xét max capacity / max_distance / phương án giao hàng.
     """
+
     # 1. Kiểm tra và đọc file dữ liệu
     df_orders = pd.read_excel(order_file)
     df_vehicles = pd.read_excel(vehicle_file)
     df_dist = pd.read_excel(matrix_file, index_col=0)
-    # 2. Quét & Lọc ràng buộc tải trọng (Screening)
+
+    # 2. Xác định sức chứa lớn nhất của đội xe
     max_w = df_vehicles["max_weight_kg"].max()
     max_v = df_vehicles["max_volume_m3"].max()
-    valid_orders, oversized_orders = [], []
+
+    valid_orders = []
+    oversized_orders = []
+
     for _, row in df_orders.iterrows():
+
         w = float(row.get("total_weight_kg", 0.0))
         v = float(row.get("total_volume_m3", 0.0))
+
         record = row.to_dict()
-        if w > max_w or v > max_v:
+
+        # ------------------------------------------------------------
+        # QUAN TRỌNG:
+        # KHÔNG loại đơn chỉ vì:
+        #     w > max_w
+        #     hoặc v > max_v
+        #
+        # Vì đây mới chỉ là SCREENING.
+        # Quyết định:
+        #   - 1 xe
+        #   - 2 xe nhà
+        #   - GHTK
+        #   - dịch vụ 500K
+        #   - thuê ngoài
+        #
+        # phải được thực hiện SAU KHI Clarke-Wright lập tuyến.
+        # ------------------------------------------------------------
+
+        # Tìm toàn bộ xe có khả năng đáp ứng đồng thời:
+        #   1. trọng lượng
+        #   2. thể tích
+        eligible = df_vehicles[
+            (df_vehicles["max_weight_kg"] >= w) &
+            (df_vehicles["max_volume_m3"] >= v)
+        ]
+
+        record["eligible_vehicles"] = eligible["vehicle_id"].tolist()
+
+        # Tất cả đơn vẫn được giữ lại để Clarke-Wright xử lý.
+        valid_orders.append(record)
+
+        # Chỉ đánh dấu "oversized" nếu bản thân đơn vượt quá 150%
+        # khả năng lớn nhất của đội xe.
+        #
+        # Đây chỉ là thông tin cảnh báo/screening,
+        # KHÔNG loại đơn khỏi valid_orders.
+        if w > 1.5 * max_w or v > 1.5 * max_v:
             oversized_orders.append(record)
-        else:
-            record["eligible_vehicles"] = df_vehicles[
-                (df_vehicles["max_weight_kg"] >= w) &
-                (df_vehicles["max_volume_m3"] >= v)
-            ]["vehicle_id"].tolist()
-            valid_orders.append(record)
-    # 3. Trả về toàn bộ package dữ liệu sẵn sàng "bơm" thẳng vào cell chạy mô hình tuyến
+
+    # 3. Trả về toàn bộ package dữ liệu sẵn sàng
+    #    "bơm" thẳng vào cell chạy Clarke-Wright
     return {
         "valid_orders": valid_orders,
         "oversized_orders": oversized_orders,
         "distance_matrix": df_dist,
-        "fleet_max_specs": {"max_weight": max_w, "max_volume": max_v}
+        "fleet_max_specs": {
+            "max_weight": max_w,
+            "max_volume": max_v
+        }
     }
+
+
 def evaluate_route_time_constraint(route_data, service_time_rules=None):
     """
     Hàm xử lý constraint thời gian tuyến (Time Windows <= 8 giờ):
-    - route_data: Dict chứa thông tin tuyến đường (danh sách khách hàng, danh sách đơn hàng, tổng quãng đường, loại đơn B2C/B2B, xe vận chuyển).
-    - service_time_rules: Quy định thời gian bốc/dỡ hàng (mặc định B2C: 25' load + 35' unload; B2B: 45' load + 60' unload).
+    - route_data: Dict chứa thông tin tuyến đường (danh sách khách hàng,
+      danh sách đơn hàng, tổng quãng đường, loại đơn B2C/B2B, xe vận chuyển).
+    - service_time_rules: Quy định thời gian bốc/dỡ hàng
+      (mặc định B2C: 25' load + 35' unload;
+       B2B: 45' load + 60' unload).
     """
+
     if service_time_rules is None:
         service_time_rules = {
-            "B2C": {"loading": 25, "unloading": 35}, # Tổng 60 phút = 1 giờ
-            "B2B": {"loading": 45, "unloading": 60}  # Tổng 105 phút = 1.75 giờ
+            "B2C": {"loading": 25, "unloading": 35},
+            "B2B": {"loading": 45, "unloading": 60}
         }
+
     # 1. Lấy thông tin từ tuyến
     orders_in_route = route_data.get("orders", [])
     total_distance_km = route_data.get("total_distance_km", 0.0)
-    vehicle_speed_kmh = route_data.get("vehicle_speed_kmh", 40.0) # Vận tốc của xe được gán từ DIM_VEHICLE
-    current_date = route_data.get("current_date", "2026-04-03") # Ngày hiện tại của đơn
-    # 2. Tính Travel Time (giờ) = Quãng đường / Vận tốc xe
-    travel_time_hours = total_distance_km / vehicle_speed_kmh if vehicle_speed_kmh > 0 else 0.0
-    # 3. Tính Service Time (tổng thời gian bốc/dỡ cho tất cả đơn trong tuyến) (đổi ra giờ)
+    vehicle_speed_kmh = route_data.get("vehicle_speed_kmh", 40.0)
+    current_date = route_data.get("current_date", "2026-04-03")
+
+    # 2. Tính Travel Time
+    travel_time_hours = (
+        total_distance_km / vehicle_speed_kmh
+        if vehicle_speed_kmh > 0 else 0.0
+    )
+
+    # 3. Tính Service Time
     total_service_minutes = 0.0
+
     for order in orders_in_route:
-        o_specs = service_time_rules.get(order.get("order_type", "B2C"), service_time_rules["B2C"])
-        total_service_minutes += (o_specs["loading"] + o_specs["unloading"])
+        o_specs = service_time_rules.get(
+            order.get("order_type", "B2C"),
+            service_time_rules["B2C"]
+        )
+
+        total_service_minutes += (
+            o_specs["loading"] +
+            o_specs["unloading"]
+        )
+
     service_time_hours = total_service_minutes / 60.0
-    # 4. Tổng thời gian hoàn thành tuyến (giờ)
-    total_route_duration_hours = travel_time_hours + service_time_hours
-    MAX_HOURS_ALLOWED = 8.0 # Giới hạn tối đa 8 tiếng/ngày
+
+    # 4. Tổng thời gian hoàn thành tuyến
+    total_route_duration_hours = (
+        travel_time_hours +
+        service_time_hours
+    )
+
+    MAX_HOURS_ALLOWED = 8.0
     result_status = {}
+
     # --- PHÂN CASE THEO YÊU CẦU ---
     if total_route_duration_hours <= MAX_HOURS_ALLOWED:
-        # CASE 1: Đạt yêu cầu (<= 8h)
+
         result_status = {
             "status": "APPROVED",
             "message": "✅ Đạt yêu cầu thời gian tuyến (<= 8h)",
             "total_hours": round(total_route_duration_hours, 2),
             "route": route_data.get("route", [])
         }
+
     else:
-        # Vượt quá 8h -> Phân tách 2 kịch bản phụ theo yêu cầu
-        # Kịch bản phụ A: Đẩy đơn/khách vi phạm quay trở lại pool hàng để thuật toán Clarke-Wright tiếp tục gom nhóm lại vào tuyến khác.
-        # Kịch bản phụ B: Backlog sang ngày hôm sau (tính số ngày backlog, lưu vết nguồn gốc ngày ban đầu) và chạy ngầm sang pool ngày hôm sau.
-        # Ở đây ta đánh dấu cờ backlog và ghi nhận nguồn gốc ngày
+
         backlog_orders = []
+
         for order in orders_in_route:
             order_backlog_info = order.copy()
-            order_backlog_info["backlog_days_count"] = order.get("backlog_days_count", 0) + 1
-            order_backlog_info["original_date"] = order.get("original_date", current_date)
-            order_backlog_info["backlog_reason"] = f"Tuyến vượt quá 8h ({total_route_duration_hours:.2f}h)"
+
+            order_backlog_info["backlog_days_count"] = (
+                order.get("backlog_days_count", 0) + 1
+            )
+
+            order_backlog_info["original_date"] = (
+                order.get("original_date", current_date)
+            )
+
+            order_backlog_info["backlog_reason"] = (
+                f"Tuyến vượt quá 8h ({total_route_duration_hours:.2f}h)"
+            )
+
             backlog_orders.append(order_backlog_info)
+
         result_status = {
             "status": "BACKLOG_OR_REPOOL",
-            "message": "⚠️ Tuyến vượt quá giới hạn 8h! Đẩy đơn sang pool xử lý ngầm (Backlog ngày tiếp theo / Tái gộp Clarke-Wright)",
+            "message": (
+                "⚠️ Tuyến vượt quá giới hạn 8h! "
+                "Đẩy đơn sang pool xử lý ngầm "
+                "(Backlog ngày tiếp theo / Tái gộp Clarke-Wright)"
+            ),
             "total_hours": round(total_route_duration_hours, 2),
-            "repool_orders": orders_in_route, # Đẩy lại vào pool cho Clarke-Wright
-            "backlog_orders_next_day": backlog_orders # Backlog chạy ngầm sang ngày mai kèm đếm số ngày backlog
+            "repool_orders": orders_in_route,
+            "backlog_orders_next_day": backlog_orders
         }
+
     return result_status
 # ============================================================================
 # CLARKE-WRIGHT SAVINGS: RoutePlanner + simulate_all
@@ -1793,7 +1881,7 @@ class RoutePlanner:
             )]
 
         # 2) Quét TOÀN BỘ xe nhà còn khả dụng tại kho theo 2 constraint tải trọng + thể tích.
-        #    Chỉ khi tìm được ít nhất 1 xe đủ weight + volume mới xét max_distance.
+        #    Chỉ khi tìm được ít nhất 1 xe đủ weight + volume mới xét Max_Distance.
         cands = [
             (i, r) for i, r in pool.items()
             if r["wh_id"] == wh_id
@@ -1802,12 +1890,12 @@ class RoutePlanner:
         ]
         cands = sorted(cands, key=lambda t: (t[1]["max_volume_m3"], t[1]["max_weight_kg"]))
 
-        # 3) Có xe khả thi về weight + volume -> mới xét max_distance.
-        #    Nếu xe phù hợp về tải nhưng vượt max_distance, lúc đó mới kích hoạt
+        # 3) Có xe khả thi về weight + volume -> mới xét Max_Distance.
+        #    Nếu xe phù hợp về tải nhưng vượt Max_Distance, lúc đó mới kích hoạt
         #    điều kiện giao hàng tiết kiệm.
         if cands:
             for idx, vrow in cands:
-                if m["km"] <= float(vrow["max_distance"]):
+                if m["km"] <= float(vrow["Max_Distance"]):
                     pool.pop(idx)
                     return [make_route(
                         route, vrow=vrow, external=False,
@@ -1815,7 +1903,7 @@ class RoutePlanner:
                         speed=vrow["speed_kmh"], fx=vrow["fixed_cost"], vr=vrow["variable_cost_per_km"]
                     )]
 
-            # Tất cả xe đã đạt weight + volume nhưng đều vượt max_distance.
+            # Tất cả xe đã đạt weight + volume nhưng đều vượt Max_Distance.
             # LÚC NÀY mới xét giao hàng tiết kiệm.
             if m["w"] < 20 and m["v"] < 0.6:
                 return [make_route(
@@ -1884,7 +1972,7 @@ class RoutePlanner:
             for part, vrow in zip(parts, (v1, v2)):
                 if not self.feasible(part, wh_id, demand):
                     return None
-                if self.metrics(part, wh_id, demand)["km"] > float(vrow["max_distance"]):
+                if self.metrics(part, wh_id, demand)["km"] > float(vrow["Max_Distance"]):
                     return None
             return parts
 
