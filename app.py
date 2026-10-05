@@ -1147,6 +1147,10 @@ def render_result(prefix, title):
     res = st.session_state.get(f"{prefix}_result")
     if not res:
         return None
+    extra = res.get("extra") or {}
+    if "mapping" not in extra or "report" not in extra:  # kết quả cũ còn sót từ phiên bản trước -> bỏ
+        st.session_state.pop(f"{prefix}_result", None)
+        return None
     st.markdown(f"### {title}")
     st.success(res["summary"])
     cols = st.columns(len(res["metrics"]))
