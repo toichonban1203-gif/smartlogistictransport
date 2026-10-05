@@ -297,255 +297,544 @@ def render_result(prefix, title):
 # ============================================================================
 # TAB 1 — FLEET: logic gốc (Semantic Mapping · làm sạch · validate)
 # ============================================================================
+# ============================================================================
+# VEHICLE / FLEET — SEMANTIC MAPPING + CLEANING + VALIDATE + EXPORT
+# ============================================================================
 
 VEHICLE_FIELDS = {
-    "vehicle_id": ("Mã xe", ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"]),
-    "license_plate": ("Biển số", ["biển số", "bien so", "bsx", "license plate", "plate", "số xe", "so xe"]),
-    "warehouse_id": ("ID kho hoạt động", ["kho", "warehouse", "wh", "hub", "chi nhánh", "location", "ma kho", "id kho", "khu vực"]),
-    "max_weight": ("Trọng tải khối lượng (kg)", ["trọng tải", "trong tai", "weight", "payload", "khối lượng", "khoi luong", "kg", "tấn", "tan", "capacity kg"]),
-    "max_volume": ("Trọng tải thể tích (m3)", ["thể tích", "the tich", "volume", "m3", "cbm", "capacity m3"]),
-    "average_speed": ("Vận tốc trung bình (km/h)", ["vận tốc", "van toc", "speed", "vận tốc trung bình", "toc do trung binh", "avg speed", "kmh", "km/h"]),
-    "fixed_cost": ("Chi phí cố định", ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"]),
-    "variable_cost": ("Chi phí biến đổi", ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"])
+    "vehicle_id": (
+        "Mã xe",
+        [
+            "mã xe",
+            "vehicle id",
+            "vehicle code",
+            "vehicle",
+            "xe",
+            "id xe",
+            "truck id",
+            "mã phương tiện"
+        ]
+    ),
+
+    "license_plate": (
+        "Biển số",
+        [
+            "biển số",
+            "bien so",
+            "bsx",
+            "license plate",
+            "plate",
+            "số xe",
+            "so xe"
+        ]
+    ),
+
+    "warehouse_id": (
+        "ID kho hoạt động",
+        [
+            "kho",
+            "warehouse",
+            "wh",
+            "hub",
+            "chi nhánh",
+            "location",
+            "ma kho",
+            "id kho",
+            "khu vực"
+        ]
+    ),
+
+    "max_weight": (
+        "Trọng tải khối lượng (kg)",
+        [
+            "trọng tải",
+            "trong tai",
+            "weight",
+            "payload",
+            "khối lượng",
+            "khoi luong",
+            "kg",
+            "tấn",
+            "tan",
+            "capacity kg"
+        ]
+    ),
+
+    "max_volume": (
+        "Trọng tải thể tích (m3)",
+        [
+            "thể tích",
+            "the tich",
+            "volume",
+            "m3",
+            "cbm",
+            "capacity m3"
+        ]
+    ),
+
+    # ------------------------------------------------------------------------
+    # QUAN TRỌNG:
+    # Tên output chuẩn phải là "Max_Distance"
+    # ------------------------------------------------------------------------
+    "max_distance": (
+        "Max_Distance",
+        [
+            "max_distance",
+            "max distance",
+            "quãng đường tối đa",
+            "quang duong toi da",
+            "maximum distance",
+            "max km",
+            "distance limit"
+        ]
+    ),
+
+    "average_speed": (
+        "Vận tốc trung bình (km/h)",
+        [
+            "vận tốc",
+            "van toc",
+            "speed",
+            "vận tốc trung bình",
+            "toc do trung binh",
+            "avg speed",
+            "kmh",
+            "km/h"
+        ]
+    ),
+
+    "fixed_cost": (
+        "Chi phí cố định",
+        [
+            "chi phí cố định",
+            "chi phi co dinh",
+            "fixed cost",
+            "cost fix",
+            "fixed"
+        ]
+    ),
+
+    "variable_cost": (
+        "Chi phí biến đổi",
+        [
+            "chi phí biến đổi",
+            "chi phi bien doi",
+            "variable cost",
+            "variable",
+            "cost km",
+            "chi phí theo km"
+        ]
+    )
 }
+
+
 def fleet_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
-    if values.empty: return 0.0
-    if field in ["max_weight", "max_volume", "average_speed", "fixed_cost", "variable_cost"]:
-        return float(values.str.replace(r"[^\d.]", "", regex=True).notna().mean())
+
+    if values.empty:
+        return 0.0
+
+    if field in [
+        "max_weight",
+        "max_volume",
+        "max_distance",
+        "average_speed",
+        "fixed_cost",
+        "variable_cost"
+    ]:
+        return float(
+            values
+            .str.replace(r"[^\d.]", "", regex=True)
+            .ne("")
+            .mean()
+        )
+
     return float(values.nunique() / len(values))
+
+
 def parse_num(val):
-    if is_blank(val): return 0.0
+    if is_blank(val):
+        return 0.0
+
     try:
         cleaned = re.sub(r"[^\d.-]", "", str(val))
         return float(cleaned) if cleaned else 0.0
-    except: return 0.0
-def process_vehicle(v_id, plate, wh_id, weight, volume, speed, f_cost, v_cost):
+    except Exception:
+        return 0.0
+
+
+def process_vehicle(
+    v_id,
+    plate,
+    wh_id,
+    weight,
+    volume,
+    max_distance,
+    speed,
+    f_cost,
+    v_cost
+):
     raw_id = "" if is_blank(v_id) else str(v_id).strip()
     raw_plate = "" if is_blank(plate) else str(plate).strip()
     raw_wh = "" if is_blank(wh_id) else str(wh_id).strip()
+
     result = {
         "vehicle_id": raw_id,
         "license_plate": raw_plate,
         "id_warehouse": raw_wh,
+
+        # Năng lực xe
         "max_weight_kg": parse_num(weight),
         "max_volume_m3": parse_num(volume),
+
+        # Giới hạn quãng đường
+        # GIỮ NGUYÊN TÊN CỘT OUTPUT: Max_Distance
+        "Max_Distance": parse_num(max_distance),
+
+        # Thông số vận hành
         "average_speed_kmh": parse_num(speed),
+
+        # Chi phí
         "fixed_cost": parse_num(f_cost),
         "variable_cost": parse_num(v_cost),
+
         "trạng_thái": "✅ Hợp lệ"
     }
+
     return result
+
+
 def fleet_validate_output(df):
     out = df.copy()
+
     dup_id = out["vehicle_id"].astype(str).duplicated(keep=False)
     dup_plate = out["license_plate"].astype(str).duplicated(keep=False)
+
     msgs = []
+
     for i, row in out.iterrows():
         errs = []
-        if is_blank(row.get("vehicle_id")): errs.append("Thiếu Mã xe")
-        if is_blank(row.get("license_plate")): errs.append("Thiếu Biển số")
-        if is_blank(row.get("id_warehouse")): errs.append("Thiếu ID kho hoạt động")
-        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")): errs.append("Trùng Mã xe")
-        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")): errs.append("Trùng Biển số")
-        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu phương tiện chuẩn")
+
+        # --------------------------------------------------------------------
+        # Bắt buộc
+        # --------------------------------------------------------------------
+        if is_blank(row.get("vehicle_id")):
+            errs.append("Thiếu Mã xe")
+
+        if is_blank(row.get("license_plate")):
+            errs.append("Thiếu Biển số")
+
+        if is_blank(row.get("id_warehouse")):
+            errs.append("Thiếu ID kho hoạt động")
+
+        # --------------------------------------------------------------------
+        # Trùng ID / biển số
+        # --------------------------------------------------------------------
+        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")):
+            errs.append("Trùng Mã xe")
+
+        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")):
+            errs.append("Trùng Biển số")
+
+        # --------------------------------------------------------------------
+        # Kiểm tra Max_Distance
+        # --------------------------------------------------------------------
+        max_distance = row.get("Max_Distance")
+
+        if (
+            max_distance is None
+            or pd.isna(max_distance)
+            or float(max_distance) <= 0
+        ):
+            errs.append("Thiếu hoặc sai Max_Distance")
+
+        msgs.append(
+            "❌ " + "; ".join(errs)
+            if errs
+            else "✅ Đủ dữ liệu phương tiện chuẩn"
+        )
+
     out["kiểm_tra"] = msgs
+
     return out
 
 
 def fleet_semantic_mapping(df):
-    return basic_semantic_mapping(df, VEHICLE_FIELDS, fleet_profile_score, 0.35)
+    return basic_semantic_mapping(
+        df,
+        VEHICLE_FIELDS,
+        fleet_profile_score,
+        0.35
+    )
 
 
 def fleet_empty_table():
     return pd.DataFrame({
-        "Mã xe": ["VEH_01", "VEH_02"], "Biển số": ["29C-123.45", "29C-678.90"],
-        "ID kho": ["WH_HN_01", "WH_HN_01"], "Trọng tải (kg)": [5000, 2000],
-        "Thể tích (m3)": [20, 10], "Vận tốc (km/h)": [50, 45],
-        "Chi phí cố định": [500000, 300000], "Chi phí biến đổi": [5000, 4000],
+        "Mã xe": [
+            "VEH_01",
+            "VEH_02"
+        ],
+
+        "Biển số": [
+            "29C-123.45",
+            "29C-678.90"
+        ],
+
+        "ID kho": [
+            "WH_HN_01",
+            "WH_HN_01"
+        ],
+
+        "Trọng tải (kg)": [
+            5000,
+            2000
+        ],
+
+        "Thể tích (m3)": [
+            20,
+            10
+        ],
+
+        # ------------------------------------------------------------
+        # Cột mẫu Max_Distance
+        # ------------------------------------------------------------
+        "Max_Distance": [
+            300,
+            200
+        ],
+
+        "Vận tốc (km/h)": [
+            50,
+            45
+        ],
+
+        "Chi phí cố định": [
+            500000,
+            300000
+        ],
+
+        "Chi phí biến đổi": [
+            5000,
+            4000
+        ],
     })
 
 
 def fleet_process_all(raw_df, chosen):
     colmap = build_colmap(raw_df, chosen)
+
     rows = []
+
     for _, row in raw_df.iterrows():
-        rows.append(process_vehicle(
-            pick(row, colmap, "vehicle_id", ""), pick(row, colmap, "license_plate", ""),
-            pick(row, colmap, "warehouse_id", ""), pick(row, colmap, "max_weight", 0),
-            pick(row, colmap, "max_volume", 0), pick(row, colmap, "average_speed", 0),
-            pick(row, colmap, "fixed_cost", 0), pick(row, colmap, "variable_cost", 0)))
-    return fleet_validate_output(pd.DataFrame(rows))
+
+        rows.append(
+            process_vehicle(
+                # --------------------------------------------------------
+                # ID / nhận diện
+                # --------------------------------------------------------
+                pick(
+                    row,
+                    colmap,
+                    "vehicle_id",
+                    ""
+                ),
+
+                pick(
+                    row,
+                    colmap,
+                    "license_plate",
+                    ""
+                ),
+
+                pick(
+                    row,
+                    colmap,
+                    "warehouse_id",
+                    ""
+                ),
+
+                # --------------------------------------------------------
+                # Năng lực tải
+                # --------------------------------------------------------
+                pick(
+                    row,
+                    colmap,
+                    "max_weight",
+                    0
+                ),
+
+                pick(
+                    row,
+                    colmap,
+                    "max_volume",
+                    0
+                ),
+
+                # --------------------------------------------------------
+                # GIỚI HẠN QUÃNG ĐƯỜNG
+                # --------------------------------------------------------
+                pick(
+                    row,
+                    colmap,
+                    "max_distance",
+                    0
+                ),
+
+                # --------------------------------------------------------
+                # Vận hành
+                # --------------------------------------------------------
+                pick(
+                    row,
+                    colmap,
+                    "average_speed",
+                    0
+                ),
+
+                # --------------------------------------------------------
+                # Chi phí
+                # --------------------------------------------------------
+                pick(
+                    row,
+                    colmap,
+                    "fixed_cost",
+                    0
+                ),
+
+                pick(
+                    row,
+                    colmap,
+                    "variable_cost",
+                    0
+                )
+            )
+        )
+
+    return fleet_validate_output(
+        pd.DataFrame(rows)
+    )
 
 
 # ============================================================================
 # TAB 1 — UI
 # ============================================================================
-def render_fleet_tab():
-    st.header("🚚 Smart Logistics — Quản lý & Chuẩn hóa Phương tiện")
-    st.markdown("**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**")
-    st.info("🔒 Cột nào không có trong file, hệ thống sẽ tự động để trống hoặc mặc định mà không làm gián đoạn.")
-    mode, edited, uploaded = render_input_block("fleet", "phương tiện", fleet_empty_table())
 
-    if st.button("🔍 Quét & Semantic Mapping", key="fleet_scan", type="primary"):
-        run_scan("fleet", "phương tiện", mode, uploaded, edited, fleet_semantic_mapping)
+def render_fleet_tab():
+
+    st.header(
+        "🚚 Smart Logistics — Quản lý & Chuẩn hóa Phương tiện"
+    )
+
+    st.markdown(
+        "**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**"
+    )
+
+    st.info(
+        "🔒 Cột nào không có trong file, hệ thống sẽ tự động để trống "
+        "hoặc mặc định mà không làm gián đoạn."
+    )
+
+    mode, edited, uploaded = render_input_block(
+        "fleet",
+        "phương tiện",
+        fleet_empty_table()
+    )
+
+    # ------------------------------------------------------------------------
+    # SCAN + SEMANTIC MAPPING
+    # ------------------------------------------------------------------------
+    if st.button(
+        "🔍 Quét & Semantic Mapping",
+        key="fleet_scan",
+        type="primary"
+    ):
+        run_scan(
+            "fleet",
+            "phương tiện",
+            mode,
+            uploaded,
+            edited,
+            fleet_semantic_mapping
+        )
 
     raw = st.session_state.get("fleet_raw")
+
     if raw is None:
         return
-    st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột phương tiện (cột nào không có chọn '-- Không sử dụng --')")
-    specs = [(f, v[0]) for f, v in VEHICLE_FIELDS.items()]
-    chosen = render_mapping("fleet", specs, raw)
 
-    if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
+    st.success(
+        f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**"
+    )
+
+    st.markdown(
+        "### 🔗 Kiểm tra ánh xạ cột phương tiện "
+        "(cột nào không có chọn '-- Không sử dụng --')"
+    )
+
+    specs = [
+        (field, label)
+        for field, (label, _) in VEHICLE_FIELDS.items()
+    ]
+
+    chosen = render_mapping(
+        "fleet",
+        specs,
+        raw
+    )
+
+    # ------------------------------------------------------------------------
+    # PROCESS + EXPORT
+    # ------------------------------------------------------------------------
+    if st.button(
+        "🚀 Chuẩn hóa & Xử lý Fleet",
+        key="fleet_process",
+        type="primary"
+    ):
         try:
-            out = fleet_process_all(raw, chosen)
-            files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
-            ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
-            store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện",
-                         [("Tổng loại xe", len(out)), ("Dòng hợp lệ", f"{ok}/{len(out)}")])
+
+            out = fleet_process_all(
+                raw,
+                chosen
+            )
+
+            # ------------------------------------------------------------
+            # Xuất DIM_VEHICLE
+            # ------------------------------------------------------------
+            files = save_outputs(
+                OUT_FLEET,
+                "DIM_VEHICLE",
+                "DIM_VEHICLE",
+                out
+            )
+
+            ok = int(
+                out["kiểm_tra"]
+                .astype(str)
+                .str.startswith("✅")
+                .sum()
+            )
+
+            store_result(
+                "fleet",
+                out,
+                files,
+                "🧭 Hoàn tất chuẩn hóa phương tiện",
+                [
+                    ("Tổng loại xe", len(out)),
+                    ("Dòng hợp lệ", f"{ok}/{len(out)}")
+                ]
+            )
+
         except Exception as exc:
-            st.error(f"❌ Lỗi chi tiết: {exc}")
-    render_result("fleet", "📊 Kết quả phương tiện")
 
+            st.error(
+                f"❌ Lỗi chi tiết: {exc}"
+            )
 
-# ============================================================================
-# TAB 2 — WAREHOUSE: logic gốc (làm sạch địa chỉ · ArcGIS · validate)
-# ============================================================================
-
-def coordinate_in_vietnam(lat, lng):
-    try: lat, lng = float(lat), float(lng)
-    except: return False
-    return VIETNAM_BOUNDS[0] <= lat <= VIETNAM_BOUNDS[1] and VIETNAM_BOUNDS[2] <= lng <= VIETNAM_BOUNDS[3]
-ADDRESS_ABBR = [(r"\bTP\.?\b", "Thành phố"), (r"\bQ\.?\b", "Quận"), (r"\bH\.?\b", "Huyện"), (r"\bTX\.?\b", "Thị xã"), (r"\bTT\.?\b", "Thị trấn"), (r"\bP\.?\b", "Phường"), (r"\bX\.?\b", "Xã"), (r"\bĐg\.?\b", "Đường")]
-def clean_address(address):
-    if is_blank(address): return ""
-    text = str(address).replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    text = re.sub(r"[\u00A0\u2000-\u200B\u202F\u3000]", " ", text)
-    text = re.sub(r"\s*[|;→–—]\s*", ", ", text)
-    text = re.sub(r"\s+-\s+", ", ", text)
-    text = re.sub(r"(?<=[A-Za-zÀ-ỹ])\s*/\s*(?=[A-Za-zÀ-ỹ])", ", ", text)
-    text = re.sub(r"[^0-9A-Za-zÀ-ỹĐđ\s,./'-]", " ", text)
-    for p, r in ADDRESS_ABBR: text = re.sub(p, r, text, flags=re.IGNORECASE)
-    text = re.sub(r"\.{2,}", ".", text)
-    text = re.sub(r"\s*,\s*", ", ", text)
-    text = re.sub(r",\s*,+", ", ", text)
-    text = re.sub(r"\s+", " ", text).strip(" ,.")
-    if text and not re.search(r"\bViệt Nam\b|\bVietnam\b", text, re.I): text += ", Việt Nam"
-    return text
-def address_quality(address):
-    if not address: return 0.0, "❌ Địa chỉ trống"
-    score, notes = 0.0, []
-    if len(address) >= 10: score += 0.25
-    else: notes.append("địa chỉ ngắn")
-    if "," in address: score += 0.20
-    else: notes.append("thiếu separator")
-    if re.search(r"\d", address): score += 0.15
-    if re.search(r"\b(Phường|Xã|Quận|Huyện|Thành phố|Tỉnh|Thị xã)\b", address, re.I): score += 0.30
-    else: notes.append("thiếu thành phần hành chính")
-    if re.search(r"\bViệt Nam\b", address, re.I): score += 0.10
-    return min(score, 1.0), ("✅ Địa chỉ sạch" if not notes else "⚠️ " + "; ".join(notes))
-WAREHOUSE_FIELDS = {"warehouse_id": ("Mã kho", ["mã kho", "warehouse id", "warehouse code", "warehouse", "kho", "id kho", "invent id", "invent_id"]), "address": ("Địa chỉ kho", ["địa chỉ", "địa điểm", "address", "location", "vị trí"])}
-def wh_profile_score(series, field):
-    values = series.dropna().astype(str).str.strip()
-    values = values[values != ""]
-    if values.empty: return 0.0
-    if field == "address": return float(0.7 * (values.str.len() >= 10).mean() + 0.3 * values.str.contains(r"[,\-/]").mean())
-    return float(values.nunique() / len(values))
-def process_warehouse(warehouse_id, address, do_geocode=True):
-    raw_address = "" if is_blank(address) else str(address).strip()
-    cleaned = clean_address(raw_address)
-    quality, clean_status = address_quality(cleaned)
-    result = {"id_warehouse": "" if is_blank(warehouse_id) else str(warehouse_id).strip(), "address": cleaned, "lat": None, "lng": None, "địa_chỉ_gốc": raw_address, "chất_lượng_địa_chỉ": quality, "trạng_thái_làm_sạch": clean_status, "địa_chỉ_geocode": "", "geocode_score": None, "trạng_thái_geocode": "—", "nguồn_tọa_độ": ""}
-    if is_blank(warehouse_id): result["trạng_thái_geocode"] = "❌ Thiếu Mã kho"; return result
-    if not cleaned: result["trạng_thái_geocode"] = "❌ Không có địa chỉ để geocode"; return result
-    if not do_geocode: result["trạng_thái_geocode"] = "⏸️ Đã tắt geocoding"; return result
-    geo = geocode_address(cleaned)
-    if not geo["ok"]: result["trạng_thái_geocode"] = geo["status"]; return result
-    result.update({"lat": geo["lat"], "lng": geo["lng"], "địa_chỉ_geocode": geo["display_name"], "geocode_score": geo["score"], "trạng_thái_geocode": f"✅ ArcGIS geocode thành công" + (f" | score {geo['score']:.0f}" if geo["score"] is not None else ""), "nguồn_tọa_độ": "ArcGIS"})
-    return result
-def warehouse_validate_output(df):
-    out = df.copy()
-    dup = out["id_warehouse"].astype(str).duplicated(keep=False)
-    msgs = []
-    for i, row in out.iterrows():
-        errs = []
-        if is_blank(row.get("id_warehouse")): errs.append("Thiếu Mã kho")
-        if is_blank(row.get("address")): errs.append("Thiếu địa chỉ")
-        lat, lng = row.get("lat"), row.get("lng")
-        if pd.isna(lat) or pd.isna(lng): errs.append("Chưa có Lat/Lon")
-        elif not coordinate_in_vietnam(lat, lng): errs.append("Lat/Lon ngoài Việt Nam")
-        if dup.iloc[i] and not is_blank(row.get("id_warehouse")): errs.append("Trùng Mã kho")
-        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu + Lat/Lon hợp lệ")
-    out["kiểm_tra"] = msgs
-    return out
-
-
-def wh_semantic_mapping(df):
-    return basic_semantic_mapping(df, WAREHOUSE_FIELDS, wh_profile_score, 0.40)
-
-
-@st.cache_resource(show_spinner=False)
-def get_geocoder():
-    try:
-        return ArcGIS(user_agent="smart-logistics-warehouse/1.0", timeout=10)
-    except Exception:
-        return None
-
-
-@st.cache_resource(show_spinner=False)
-def _geo_cache():
-    return {}
-
-
-def geocode_address(address, retries=3):
-    """Geocode 1 địa chỉ bằng ArcGIS (có cache; không cache lỗi mạng)."""
-    if not address:
-        return {"ok": False, "status": "❌ Địa chỉ trống"}
-    cache = _geo_cache()
-    if address in cache:
-        return cache[address]
-    geocoder = get_geocoder()
-    if geocoder is None:
-        return {"ok": False, "status": "❌ Không khởi tạo được ArcGIS"}
-    last_error = ""
-    for attempt in range(1, retries + 1):
-        try:
-            loc = geocoder.geocode(address, timeout=10)
-            if loc is None:
-                res = {"ok": False, "status": "⚠️ ArcGIS không tìm thấy địa chỉ"}
-                cache[address] = res
-                return res
-            raw = getattr(loc, "raw", {}) or {}
-            score = raw.get("score")
-            try:
-                score = float(score) if score is not None else None
-            except Exception:
-                score = None
-            lat, lng = float(loc.latitude), float(loc.longitude)
-            if not coordinate_in_vietnam(lat, lng):
-                res = {"ok": False, "status": "⚠️ ArcGIS trả tọa độ ngoài Việt Nam"}
-                cache[address] = res
-                return res
-            res = {"ok": True, "lat": lat, "lng": lng, "display_name": getattr(loc, "address", "") or "", "score": score}
-            cache[address] = res
-            return res
-        except Exception as exc:
-            last_error = str(exc)
-            if attempt < retries:
-                time.sleep(1)
-    return {"ok": False, "status": f"❌ ArcGIS lỗi sau {retries} lần: {last_error[:150]}"}
-
-
-def warehouse_empty_table():
-    return pd.DataFrame({
-        "Mã kho": ["WH_HN_01"],
-        "Địa chỉ kho": ["Số 1 Tràng Tiền, Hoàn Kiếm, Hà Nội"],
-    })
-
-
+    render_result(
+        "fleet",
+        "📊 Kết quả phương tiện"
+    )
 # ============================================================================
 # TAB 2 — UI
 # ============================================================================
