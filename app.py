@@ -1765,8 +1765,8 @@ class RoutePlanner:
         primary, assistant, backup = assign_driver(wh_id)
         km, hours = m["km"], m["hours"]
         start = dt.datetime.combine(pd.to_datetime(date_str).date(), dt.datetime.strptime(cfg.start_time, "%H:%M").time())
-        max_w_val = self.catalog.loc[vtype, "w"] if vtype in self.catalog.index else m["w"]
-        load_f = m["w"] / max_w_val if max_w_val > 0 else 0.5
+        max_v_val = self.catalog.loc[vtype, "v"] if vtype in self.catalog.index else m["v"]
+        load_f = m["v"] / max_v_val if max_v_val > 0 else 0.5
         return {
             "kind": "NORMAL", "wh_id": wh_id, "route": list(route), "orders": [o for c in route for o in by_cust[c]],
             "vehicle_id": vid, "license_plate": plate, "vehicle_type": vtype, "external": external,
