@@ -1,0 +1,8 @@
+gradio>=5.0
+pandas
+numpy
+openpyxl
+rapidfuzz
+unidecode
+geopy
+requests
