@@ -1619,7 +1619,6 @@ def evaluate_route_time_constraint(route_data, service_time_rules=None):
             "backlog_orders_next_day": backlog_orders # Backlog chạy ngầm sang ngày mai kèm đếm số ngày backlog
         }
     return result_status
-
 # ============================================================================
 # CLARKE-WRIGHT SAVINGS: RoutePlanner + simulate_all
 # ============================================================================
@@ -1793,8 +1792,8 @@ class RoutePlanner:
                 speed=35.0, fx=fx, vr=vr
             )]
 
-        # 2) Quét TOÀN BỘ xe nhà còn khả dụng tại kho.
-        #    Ưu tiên 1 xe nếu đáp ứng đồng thời weight + volume + max_distance.
+        # 2) Quét TOÀN BỘ xe nhà còn khả dụng tại kho theo 2 constraint tải trọng + thể tích.
+        #    Chỉ khi tìm được ít nhất 1 xe đủ weight + volume mới xét max_distance.
         cands = [
             (i, r) for i, r in pool.items()
             if r["wh_id"] == wh_id
@@ -1803,16 +1802,34 @@ class RoutePlanner:
         ]
         cands = sorted(cands, key=lambda t: (t[1]["max_volume_m3"], t[1]["max_weight_kg"]))
 
-        for idx, vrow in cands:
-            if m["km"] <= float(vrow["max_distance"]):
-                pool.pop(idx)
+        # 3) Có xe khả thi về weight + volume -> mới xét max_distance.
+        #    Nếu xe phù hợp về tải nhưng vượt max_distance, lúc đó mới kích hoạt
+        #    điều kiện giao hàng tiết kiệm.
+        if cands:
+            for idx, vrow in cands:
+                if m["km"] <= float(vrow["max_distance"]):
+                    pool.pop(idx)
+                    return [make_route(
+                        route, vrow=vrow, external=False,
+                        vid=vrow["vehicle_id"], plate=vrow["license_plate"], vtype=vrow["vehicle_type"],
+                        speed=vrow["speed_kmh"], fx=vrow["fixed_cost"], vr=vrow["variable_cost_per_km"]
+                    )]
+
+            # Tất cả xe đã đạt weight + volume nhưng đều vượt max_distance.
+            # LÚC NÀY mới xét giao hàng tiết kiệm.
+            if m["w"] < 20 and m["v"] < 0.6:
                 return [make_route(
-                    route, vrow=vrow, external=False,
-                    vid=vrow["vehicle_id"], plate=vrow["license_plate"], vtype=vrow["vehicle_type"],
-                    speed=vrow["speed_kmh"], fx=vrow["fixed_cost"], vr=vrow["variable_cost_per_km"]
+                    route, external=True, vid="GHTK", plate="GHTK", vtype="GHTK",
+                    speed=35.0, fx=100_000, vr=0.0
+                )]
+            elif m["w"] < 100 and m["v"] < 3:
+                return [make_route(
+                    route, external=True, vid="DỊCH VỤ 500K", plate="Dịch vụ giao hàng", vtype="Dịch vụ giao hàng",
+                    speed=35.0, fx=500_000, vr=0.0
                 )]
 
-        # 3) Không có 1 xe đủ cả tải + thể tích + distance -> ưu tiên 2 XE NHÀ.
+        # 4) Không có 1 xe đơn đủ cả weight + volume (hoặc đã có xe đủ tải nhưng
+        #    không thể xử lý bằng giao hàng tiết kiệm) -> ưu tiên 2 XE NHÀ.
         #    Quét từ xe to nhất + xe to nhì, rồi tiếp tục toàn bộ các cặp khả thi.
         pair_pool = [(i, r) for i, r in pool.items() if r["wh_id"] == wh_id]
         pair_pool = sorted(
@@ -1888,20 +1905,6 @@ class RoutePlanner:
                     )
                     for part, vrow in zip(parts, (v1, v2))
                 ]
-
-        # 4) Chỉ sau khi đã quét xe nhà (1 xe + 2 xe) mới dùng giao hàng tiết kiệm.
-        #    Điều kiện được xét THEO THỨ TỰ: nếu vượt ngưỡng GHTK thì rơi xuống
-        #    constraint 500K. Ví dụ 25kg + 0,5m3 -> 500.000đ/chuyến.
-        if m["w"] < 20 and m["v"] < 0.6:
-            return [make_route(
-                route, external=True, vid="GHTK", plate="GHTK", vtype="GHTK",
-                speed=35.0, fx=100_000, vr=0.0
-            )]
-        elif m["w"] < 100 and m["v"] < 3:
-            return [make_route(
-                route, external=True, vid="DỊCH VỤ 500K", plate="Dịch vụ giao hàng", vtype="Dịch vụ giao hàng",
-                speed=35.0, fx=500_000, vr=0.0
-            )]
 
         # 5) Ngoài 2 nhóm giao hàng trên -> giữ fallback outsource hiện tại.
         vt = m["vtype"] if m["vtype"] in self.catalog.index else (
