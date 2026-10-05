@@ -297,544 +297,255 @@ def render_result(prefix, title):
 # ============================================================================
 # TAB 1 — FLEET: logic gốc (Semantic Mapping · làm sạch · validate)
 # ============================================================================
-# ============================================================================
-# VEHICLE / FLEET — SEMANTIC MAPPING + CLEANING + VALIDATE + EXPORT
-# ============================================================================
 
 VEHICLE_FIELDS = {
-    "vehicle_id": (
-        "Mã xe",
-        [
-            "mã xe",
-            "vehicle id",
-            "vehicle code",
-            "vehicle",
-            "xe",
-            "id xe",
-            "truck id",
-            "mã phương tiện"
-        ]
-    ),
-
-    "license_plate": (
-        "Biển số",
-        [
-            "biển số",
-            "bien so",
-            "bsx",
-            "license plate",
-            "plate",
-            "số xe",
-            "so xe"
-        ]
-    ),
-
-    "warehouse_id": (
-        "ID kho hoạt động",
-        [
-            "kho",
-            "warehouse",
-            "wh",
-            "hub",
-            "chi nhánh",
-            "location",
-            "ma kho",
-            "id kho",
-            "khu vực"
-        ]
-    ),
-
-    "max_weight": (
-        "Trọng tải khối lượng (kg)",
-        [
-            "trọng tải",
-            "trong tai",
-            "weight",
-            "payload",
-            "khối lượng",
-            "khoi luong",
-            "kg",
-            "tấn",
-            "tan",
-            "capacity kg"
-        ]
-    ),
-
-    "max_volume": (
-        "Trọng tải thể tích (m3)",
-        [
-            "thể tích",
-            "the tich",
-            "volume",
-            "m3",
-            "cbm",
-            "capacity m3"
-        ]
-    ),
-
-    # ------------------------------------------------------------------------
-    # QUAN TRỌNG:
-    # Tên output chuẩn phải là "Max_Distance"
-    # ------------------------------------------------------------------------
-    "max_distance": (
-        "Max_Distance",
-        [
-            "max_distance",
-            "max distance",
-            "quãng đường tối đa",
-            "quang duong toi da",
-            "maximum distance",
-            "max km",
-            "distance limit"
-        ]
-    ),
-
-    "average_speed": (
-        "Vận tốc trung bình (km/h)",
-        [
-            "vận tốc",
-            "van toc",
-            "speed",
-            "vận tốc trung bình",
-            "toc do trung binh",
-            "avg speed",
-            "kmh",
-            "km/h"
-        ]
-    ),
-
-    "fixed_cost": (
-        "Chi phí cố định",
-        [
-            "chi phí cố định",
-            "chi phi co dinh",
-            "fixed cost",
-            "cost fix",
-            "fixed"
-        ]
-    ),
-
-    "variable_cost": (
-        "Chi phí biến đổi",
-        [
-            "chi phí biến đổi",
-            "chi phi bien doi",
-            "variable cost",
-            "variable",
-            "cost km",
-            "chi phí theo km"
-        ]
-    )
+    "vehicle_id": ("Mã xe", ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"]),
+    "license_plate": ("Biển số", ["biển số", "bien so", "bsx", "license plate", "plate", "số xe", "so xe"]),
+    "warehouse_id": ("ID kho hoạt động", ["kho", "warehouse", "wh", "hub", "chi nhánh", "location", "ma kho", "id kho", "khu vực"]),
+    "max_weight": ("Trọng tải khối lượng (kg)", ["trọng tải", "trong tai", "weight", "payload", "khối lượng", "khoi luong", "kg", "tấn", "tan", "capacity kg"]),
+    "max_volume": ("Trọng tải thể tích (m3)", ["thể tích", "the tich", "volume", "m3", "cbm", "capacity m3"]),
+    "average_speed": ("Vận tốc trung bình (km/h)", ["vận tốc", "van toc", "speed", "vận tốc trung bình", "toc do trung binh", "avg speed", "kmh", "km/h"]),
+    "fixed_cost": ("Chi phí cố định", ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"]),
+    "variable_cost": ("Chi phí biến đổi", ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"])
 }
-
-
 def fleet_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
-
-    if values.empty:
-        return 0.0
-
-    if field in [
-        "max_weight",
-        "max_volume",
-        "max_distance",
-        "average_speed",
-        "fixed_cost",
-        "variable_cost"
-    ]:
-        return float(
-            values
-            .str.replace(r"[^\d.]", "", regex=True)
-            .ne("")
-            .mean()
-        )
-
+    if values.empty: return 0.0
+    if field in ["max_weight", "max_volume", "average_speed", "fixed_cost", "variable_cost"]:
+        return float(values.str.replace(r"[^\d.]", "", regex=True).notna().mean())
     return float(values.nunique() / len(values))
-
-
 def parse_num(val):
-    if is_blank(val):
-        return 0.0
-
+    if is_blank(val): return 0.0
     try:
         cleaned = re.sub(r"[^\d.-]", "", str(val))
         return float(cleaned) if cleaned else 0.0
-    except Exception:
-        return 0.0
-
-
-def process_vehicle(
-    v_id,
-    plate,
-    wh_id,
-    weight,
-    volume,
-    max_distance,
-    speed,
-    f_cost,
-    v_cost
-):
+    except: return 0.0
+def process_vehicle(v_id, plate, wh_id, weight, volume, speed, f_cost, v_cost):
     raw_id = "" if is_blank(v_id) else str(v_id).strip()
     raw_plate = "" if is_blank(plate) else str(plate).strip()
     raw_wh = "" if is_blank(wh_id) else str(wh_id).strip()
-
     result = {
         "vehicle_id": raw_id,
         "license_plate": raw_plate,
         "id_warehouse": raw_wh,
-
-        # Năng lực xe
         "max_weight_kg": parse_num(weight),
         "max_volume_m3": parse_num(volume),
-
-        # Giới hạn quãng đường
-        # GIỮ NGUYÊN TÊN CỘT OUTPUT: Max_Distance
-        "Max_Distance": parse_num(max_distance),
-
-        # Thông số vận hành
         "average_speed_kmh": parse_num(speed),
-
-        # Chi phí
         "fixed_cost": parse_num(f_cost),
         "variable_cost": parse_num(v_cost),
-
         "trạng_thái": "✅ Hợp lệ"
     }
-
     return result
-
-
 def fleet_validate_output(df):
     out = df.copy()
-
     dup_id = out["vehicle_id"].astype(str).duplicated(keep=False)
     dup_plate = out["license_plate"].astype(str).duplicated(keep=False)
-
     msgs = []
-
     for i, row in out.iterrows():
         errs = []
-
-        # --------------------------------------------------------------------
-        # Bắt buộc
-        # --------------------------------------------------------------------
-        if is_blank(row.get("vehicle_id")):
-            errs.append("Thiếu Mã xe")
-
-        if is_blank(row.get("license_plate")):
-            errs.append("Thiếu Biển số")
-
-        if is_blank(row.get("id_warehouse")):
-            errs.append("Thiếu ID kho hoạt động")
-
-        # --------------------------------------------------------------------
-        # Trùng ID / biển số
-        # --------------------------------------------------------------------
-        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")):
-            errs.append("Trùng Mã xe")
-
-        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")):
-            errs.append("Trùng Biển số")
-
-        # --------------------------------------------------------------------
-        # Kiểm tra Max_Distance
-        # --------------------------------------------------------------------
-        max_distance = row.get("Max_Distance")
-
-        if (
-            max_distance is None
-            or pd.isna(max_distance)
-            or float(max_distance) <= 0
-        ):
-            errs.append("Thiếu hoặc sai Max_Distance")
-
-        msgs.append(
-            "❌ " + "; ".join(errs)
-            if errs
-            else "✅ Đủ dữ liệu phương tiện chuẩn"
-        )
-
+        if is_blank(row.get("vehicle_id")): errs.append("Thiếu Mã xe")
+        if is_blank(row.get("license_plate")): errs.append("Thiếu Biển số")
+        if is_blank(row.get("id_warehouse")): errs.append("Thiếu ID kho hoạt động")
+        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")): errs.append("Trùng Mã xe")
+        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")): errs.append("Trùng Biển số")
+        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu phương tiện chuẩn")
     out["kiểm_tra"] = msgs
-
     return out
 
 
 def fleet_semantic_mapping(df):
-    return basic_semantic_mapping(
-        df,
-        VEHICLE_FIELDS,
-        fleet_profile_score,
-        0.35
-    )
+    return basic_semantic_mapping(df, VEHICLE_FIELDS, fleet_profile_score, 0.35)
 
 
 def fleet_empty_table():
     return pd.DataFrame({
-        "Mã xe": [
-            "VEH_01",
-            "VEH_02"
-        ],
-
-        "Biển số": [
-            "29C-123.45",
-            "29C-678.90"
-        ],
-
-        "ID kho": [
-            "WH_HN_01",
-            "WH_HN_01"
-        ],
-
-        "Trọng tải (kg)": [
-            5000,
-            2000
-        ],
-
-        "Thể tích (m3)": [
-            20,
-            10
-        ],
-
-        # ------------------------------------------------------------
-        # Cột mẫu Max_Distance
-        # ------------------------------------------------------------
-        "Max_Distance": [
-            300,
-            200
-        ],
-
-        "Vận tốc (km/h)": [
-            50,
-            45
-        ],
-
-        "Chi phí cố định": [
-            500000,
-            300000
-        ],
-
-        "Chi phí biến đổi": [
-            5000,
-            4000
-        ],
+        "Mã xe": ["VEH_01", "VEH_02"], "Biển số": ["29C-123.45", "29C-678.90"],
+        "ID kho": ["WH_HN_01", "WH_HN_01"], "Trọng tải (kg)": [5000, 2000],
+        "Thể tích (m3)": [20, 10], "Vận tốc (km/h)": [50, 45],
+        "Chi phí cố định": [500000, 300000], "Chi phí biến đổi": [5000, 4000],
     })
 
 
 def fleet_process_all(raw_df, chosen):
     colmap = build_colmap(raw_df, chosen)
-
     rows = []
-
     for _, row in raw_df.iterrows():
-
-        rows.append(
-            process_vehicle(
-                # --------------------------------------------------------
-                # ID / nhận diện
-                # --------------------------------------------------------
-                pick(
-                    row,
-                    colmap,
-                    "vehicle_id",
-                    ""
-                ),
-
-                pick(
-                    row,
-                    colmap,
-                    "license_plate",
-                    ""
-                ),
-
-                pick(
-                    row,
-                    colmap,
-                    "warehouse_id",
-                    ""
-                ),
-
-                # --------------------------------------------------------
-                # Năng lực tải
-                # --------------------------------------------------------
-                pick(
-                    row,
-                    colmap,
-                    "max_weight",
-                    0
-                ),
-
-                pick(
-                    row,
-                    colmap,
-                    "max_volume",
-                    0
-                ),
-
-                # --------------------------------------------------------
-                # GIỚI HẠN QUÃNG ĐƯỜNG
-                # --------------------------------------------------------
-                pick(
-                    row,
-                    colmap,
-                    "max_distance",
-                    0
-                ),
-
-                # --------------------------------------------------------
-                # Vận hành
-                # --------------------------------------------------------
-                pick(
-                    row,
-                    colmap,
-                    "average_speed",
-                    0
-                ),
-
-                # --------------------------------------------------------
-                # Chi phí
-                # --------------------------------------------------------
-                pick(
-                    row,
-                    colmap,
-                    "fixed_cost",
-                    0
-                ),
-
-                pick(
-                    row,
-                    colmap,
-                    "variable_cost",
-                    0
-                )
-            )
-        )
-
-    return fleet_validate_output(
-        pd.DataFrame(rows)
-    )
+        rows.append(process_vehicle(
+            pick(row, colmap, "vehicle_id", ""), pick(row, colmap, "license_plate", ""),
+            pick(row, colmap, "warehouse_id", ""), pick(row, colmap, "max_weight", 0),
+            pick(row, colmap, "max_volume", 0), pick(row, colmap, "average_speed", 0),
+            pick(row, colmap, "fixed_cost", 0), pick(row, colmap, "variable_cost", 0)))
+    return fleet_validate_output(pd.DataFrame(rows))
 
 
 # ============================================================================
 # TAB 1 — UI
 # ============================================================================
-
 def render_fleet_tab():
+    st.header("🚚 Smart Logistics — Quản lý & Chuẩn hóa Phương tiện")
+    st.markdown("**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**")
+    st.info("🔒 Cột nào không có trong file, hệ thống sẽ tự động để trống hoặc mặc định mà không làm gián đoạn.")
+    mode, edited, uploaded = render_input_block("fleet", "phương tiện", fleet_empty_table())
 
-    st.header(
-        "🚚 Smart Logistics — Quản lý & Chuẩn hóa Phương tiện"
-    )
-
-    st.markdown(
-        "**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**"
-    )
-
-    st.info(
-        "🔒 Cột nào không có trong file, hệ thống sẽ tự động để trống "
-        "hoặc mặc định mà không làm gián đoạn."
-    )
-
-    mode, edited, uploaded = render_input_block(
-        "fleet",
-        "phương tiện",
-        fleet_empty_table()
-    )
-
-    # ------------------------------------------------------------------------
-    # SCAN + SEMANTIC MAPPING
-    # ------------------------------------------------------------------------
-    if st.button(
-        "🔍 Quét & Semantic Mapping",
-        key="fleet_scan",
-        type="primary"
-    ):
-        run_scan(
-            "fleet",
-            "phương tiện",
-            mode,
-            uploaded,
-            edited,
-            fleet_semantic_mapping
-        )
+    if st.button("🔍 Quét & Semantic Mapping", key="fleet_scan", type="primary"):
+        run_scan("fleet", "phương tiện", mode, uploaded, edited, fleet_semantic_mapping)
 
     raw = st.session_state.get("fleet_raw")
-
     if raw is None:
         return
+    st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột phương tiện (cột nào không có chọn '-- Không sử dụng --')")
+    specs = [(f, v[0]) for f, v in VEHICLE_FIELDS.items()]
+    chosen = render_mapping("fleet", specs, raw)
 
-    st.success(
-        f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**"
-    )
-
-    st.markdown(
-        "### 🔗 Kiểm tra ánh xạ cột phương tiện "
-        "(cột nào không có chọn '-- Không sử dụng --')"
-    )
-
-    specs = [
-        (field, label)
-        for field, (label, _) in VEHICLE_FIELDS.items()
-    ]
-
-    chosen = render_mapping(
-        "fleet",
-        specs,
-        raw
-    )
-
-    # ------------------------------------------------------------------------
-    # PROCESS + EXPORT
-    # ------------------------------------------------------------------------
-    if st.button(
-        "🚀 Chuẩn hóa & Xử lý Fleet",
-        key="fleet_process",
-        type="primary"
-    ):
+    if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
         try:
-
-            out = fleet_process_all(
-                raw,
-                chosen
-            )
-
-            # ------------------------------------------------------------
-            # Xuất DIM_VEHICLE
-            # ------------------------------------------------------------
-            files = save_outputs(
-                OUT_FLEET,
-                "DIM_VEHICLE",
-                "DIM_VEHICLE",
-                out
-            )
-
-            ok = int(
-                out["kiểm_tra"]
-                .astype(str)
-                .str.startswith("✅")
-                .sum()
-            )
-
-            store_result(
-                "fleet",
-                out,
-                files,
-                "🧭 Hoàn tất chuẩn hóa phương tiện",
-                [
-                    ("Tổng loại xe", len(out)),
-                    ("Dòng hợp lệ", f"{ok}/{len(out)}")
-                ]
-            )
-
+            out = fleet_process_all(raw, chosen)
+            files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
+            ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
+            store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện",
+                         [("Tổng loại xe", len(out)), ("Dòng hợp lệ", f"{ok}/{len(out)}")])
         except Exception as exc:
+            st.error(f"❌ Lỗi chi tiết: {exc}")
+    render_result("fleet", "📊 Kết quả phương tiện")
 
-            st.error(
-                f"❌ Lỗi chi tiết: {exc}"
-            )
 
-    render_result(
-        "fleet",
-        "📊 Kết quả phương tiện"
-    )
+# ============================================================================
+# TAB 2 — WAREHOUSE: logic gốc (làm sạch địa chỉ · ArcGIS · validate)
+# ============================================================================
+
+def coordinate_in_vietnam(lat, lng):
+    try: lat, lng = float(lat), float(lng)
+    except: return False
+    return VIETNAM_BOUNDS[0] <= lat <= VIETNAM_BOUNDS[1] and VIETNAM_BOUNDS[2] <= lng <= VIETNAM_BOUNDS[3]
+ADDRESS_ABBR = [(r"\bTP\.?\b", "Thành phố"), (r"\bQ\.?\b", "Quận"), (r"\bH\.?\b", "Huyện"), (r"\bTX\.?\b", "Thị xã"), (r"\bTT\.?\b", "Thị trấn"), (r"\bP\.?\b", "Phường"), (r"\bX\.?\b", "Xã"), (r"\bĐg\.?\b", "Đường")]
+def clean_address(address):
+    if is_blank(address): return ""
+    text = str(address).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"[\u00A0\u2000-\u200B\u202F\u3000]", " ", text)
+    text = re.sub(r"\s*[|;→–—]\s*", ", ", text)
+    text = re.sub(r"\s+-\s+", ", ", text)
+    text = re.sub(r"(?<=[A-Za-zÀ-ỹ])\s*/\s*(?=[A-Za-zÀ-ỹ])", ", ", text)
+    text = re.sub(r"[^0-9A-Za-zÀ-ỹĐđ\s,./'-]", " ", text)
+    for p, r in ADDRESS_ABBR: text = re.sub(p, r, text, flags=re.IGNORECASE)
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"\s*,\s*", ", ", text)
+    text = re.sub(r",\s*,+", ", ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,.")
+    if text and not re.search(r"\bViệt Nam\b|\bVietnam\b", text, re.I): text += ", Việt Nam"
+    return text
+def address_quality(address):
+    if not address: return 0.0, "❌ Địa chỉ trống"
+    score, notes = 0.0, []
+    if len(address) >= 10: score += 0.25
+    else: notes.append("địa chỉ ngắn")
+    if "," in address: score += 0.20
+    else: notes.append("thiếu separator")
+    if re.search(r"\d", address): score += 0.15
+    if re.search(r"\b(Phường|Xã|Quận|Huyện|Thành phố|Tỉnh|Thị xã)\b", address, re.I): score += 0.30
+    else: notes.append("thiếu thành phần hành chính")
+    if re.search(r"\bViệt Nam\b", address, re.I): score += 0.10
+    return min(score, 1.0), ("✅ Địa chỉ sạch" if not notes else "⚠️ " + "; ".join(notes))
+WAREHOUSE_FIELDS = {"warehouse_id": ("Mã kho", ["mã kho", "warehouse id", "warehouse code", "warehouse", "kho", "id kho", "invent id", "invent_id"]), "address": ("Địa chỉ kho", ["địa chỉ", "địa điểm", "address", "location", "vị trí"])}
+def wh_profile_score(series, field):
+    values = series.dropna().astype(str).str.strip()
+    values = values[values != ""]
+    if values.empty: return 0.0
+    if field == "address": return float(0.7 * (values.str.len() >= 10).mean() + 0.3 * values.str.contains(r"[,\-/]").mean())
+    return float(values.nunique() / len(values))
+def process_warehouse(warehouse_id, address, do_geocode=True):
+    raw_address = "" if is_blank(address) else str(address).strip()
+    cleaned = clean_address(raw_address)
+    quality, clean_status = address_quality(cleaned)
+    result = {"id_warehouse": "" if is_blank(warehouse_id) else str(warehouse_id).strip(), "address": cleaned, "lat": None, "lng": None, "địa_chỉ_gốc": raw_address, "chất_lượng_địa_chỉ": quality, "trạng_thái_làm_sạch": clean_status, "địa_chỉ_geocode": "", "geocode_score": None, "trạng_thái_geocode": "—", "nguồn_tọa_độ": ""}
+    if is_blank(warehouse_id): result["trạng_thái_geocode"] = "❌ Thiếu Mã kho"; return result
+    if not cleaned: result["trạng_thái_geocode"] = "❌ Không có địa chỉ để geocode"; return result
+    if not do_geocode: result["trạng_thái_geocode"] = "⏸️ Đã tắt geocoding"; return result
+    geo = geocode_address(cleaned)
+    if not geo["ok"]: result["trạng_thái_geocode"] = geo["status"]; return result
+    result.update({"lat": geo["lat"], "lng": geo["lng"], "địa_chỉ_geocode": geo["display_name"], "geocode_score": geo["score"], "trạng_thái_geocode": f"✅ ArcGIS geocode thành công" + (f" | score {geo['score']:.0f}" if geo["score"] is not None else ""), "nguồn_tọa_độ": "ArcGIS"})
+    return result
+def warehouse_validate_output(df):
+    out = df.copy()
+    dup = out["id_warehouse"].astype(str).duplicated(keep=False)
+    msgs = []
+    for i, row in out.iterrows():
+        errs = []
+        if is_blank(row.get("id_warehouse")): errs.append("Thiếu Mã kho")
+        if is_blank(row.get("address")): errs.append("Thiếu địa chỉ")
+        lat, lng = row.get("lat"), row.get("lng")
+        if pd.isna(lat) or pd.isna(lng): errs.append("Chưa có Lat/Lon")
+        elif not coordinate_in_vietnam(lat, lng): errs.append("Lat/Lon ngoài Việt Nam")
+        if dup.iloc[i] and not is_blank(row.get("id_warehouse")): errs.append("Trùng Mã kho")
+        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu + Lat/Lon hợp lệ")
+    out["kiểm_tra"] = msgs
+    return out
+
+
+def wh_semantic_mapping(df):
+    return basic_semantic_mapping(df, WAREHOUSE_FIELDS, wh_profile_score, 0.40)
+
+
+@st.cache_resource(show_spinner=False)
+def get_geocoder():
+    try:
+        return ArcGIS(user_agent="smart-logistics-warehouse/1.0", timeout=10)
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _geo_cache():
+    return {}
+
+
+def geocode_address(address, retries=3):
+    """Geocode 1 địa chỉ bằng ArcGIS (có cache; không cache lỗi mạng)."""
+    if not address:
+        return {"ok": False, "status": "❌ Địa chỉ trống"}
+    cache = _geo_cache()
+    if address in cache:
+        return cache[address]
+    geocoder = get_geocoder()
+    if geocoder is None:
+        return {"ok": False, "status": "❌ Không khởi tạo được ArcGIS"}
+    last_error = ""
+    for attempt in range(1, retries + 1):
+        try:
+            loc = geocoder.geocode(address, timeout=10)
+            if loc is None:
+                res = {"ok": False, "status": "⚠️ ArcGIS không tìm thấy địa chỉ"}
+                cache[address] = res
+                return res
+            raw = getattr(loc, "raw", {}) or {}
+            score = raw.get("score")
+            try:
+                score = float(score) if score is not None else None
+            except Exception:
+                score = None
+            lat, lng = float(loc.latitude), float(loc.longitude)
+            if not coordinate_in_vietnam(lat, lng):
+                res = {"ok": False, "status": "⚠️ ArcGIS trả tọa độ ngoài Việt Nam"}
+                cache[address] = res
+                return res
+            res = {"ok": True, "lat": lat, "lng": lng, "display_name": getattr(loc, "address", "") or "", "score": score}
+            cache[address] = res
+            return res
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < retries:
+                time.sleep(1)
+    return {"ok": False, "status": f"❌ ArcGIS lỗi sau {retries} lần: {last_error[:150]}"}
+
+
+def warehouse_empty_table():
+    return pd.DataFrame({
+        "Mã kho": ["WH_HN_01"],
+        "Địa chỉ kho": ["Số 1 Tràng Tiền, Hoàn Kiếm, Hà Nội"],
+    })
+
+
 # ============================================================================
 # TAB 2 — UI
 # ============================================================================
@@ -1819,183 +1530,97 @@ def load_data(cfg: Config = CFG) -> dict:
 # ============================================================================
 
 def run_master_logistics_optimizer(order_file="output_orders/DIM_ORDERS.xlsx",
-                                   vehicle_file="output_fleet/DIM_VEHICLE.xlsx",
-                                   matrix_file="output_matrix/DISTANCE_MATRIX_KM.xlsx"):
+                                     vehicle_file="output_fleet/DIM_VEHICLE.xlsx",
+                                     matrix_file="output_matrix/DISTANCE_MATRIX_KM.xlsx"):
     """
-    HÀM TỔNG MASTER:
-    Quét đơn hàng -> Xác định xe khả thi theo TRỌNG LƯỢNG + THỂ TÍCH
-    -> Không loại đơn chỉ vì vượt xe lớn nhất
-    -> Để Clarke-Wright lập tuyến trước
-    -> Sau khi có tuyến mới xét max capacity / max_distance / phương án giao hàng.
+    HÀM TỔNG MASTER: Quét đơn hàng -> Lọc đội xe -> Tách đơn quá cỡ -> Đọc ma trận -> Sẵn sàng chạy Clarke-Wright.
     """
-
     # 1. Kiểm tra và đọc file dữ liệu
     df_orders = pd.read_excel(order_file)
     df_vehicles = pd.read_excel(vehicle_file)
     df_dist = pd.read_excel(matrix_file, index_col=0)
-
-    # 2. Xác định sức chứa lớn nhất của đội xe
+    # 2. Quét & Lọc ràng buộc tải trọng (Screening)
     max_w = df_vehicles["max_weight_kg"].max()
     max_v = df_vehicles["max_volume_m3"].max()
-
-    valid_orders = []
-    oversized_orders = []
-
+    valid_orders, oversized_orders = [], []
     for _, row in df_orders.iterrows():
-
         w = float(row.get("total_weight_kg", 0.0))
         v = float(row.get("total_volume_m3", 0.0))
-
         record = row.to_dict()
-
-        # ------------------------------------------------------------
-        # QUAN TRỌNG:
-        # KHÔNG loại đơn chỉ vì:
-        #     w > max_w
-        #     hoặc v > max_v
-        #
-        # Vì đây mới chỉ là SCREENING.
-        # Quyết định:
-        #   - 1 xe
-        #   - 2 xe nhà
-        #   - GHTK
-        #   - dịch vụ 500K
-        #   - thuê ngoài
-        #
-        # phải được thực hiện SAU KHI Clarke-Wright lập tuyến.
-        # ------------------------------------------------------------
-
-        # Tìm toàn bộ xe có khả năng đáp ứng đồng thời:
-        #   1. trọng lượng
-        #   2. thể tích
-        eligible = df_vehicles[
-            (df_vehicles["max_weight_kg"] >= w) &
-            (df_vehicles["max_volume_m3"] >= v)
-        ]
-
-        record["eligible_vehicles"] = eligible["vehicle_id"].tolist()
-
-        # Tất cả đơn vẫn được giữ lại để Clarke-Wright xử lý.
-        valid_orders.append(record)
-
-        # Chỉ đánh dấu "oversized" nếu bản thân đơn vượt quá 150%
-        # khả năng lớn nhất của đội xe.
-        #
-        # Đây chỉ là thông tin cảnh báo/screening,
-        # KHÔNG loại đơn khỏi valid_orders.
-        if w > 1.5 * max_w or v > 1.5 * max_v:
+        if w > max_w or v > max_v:
             oversized_orders.append(record)
-
-    # 3. Trả về toàn bộ package dữ liệu sẵn sàng
-    #    "bơm" thẳng vào cell chạy Clarke-Wright
+        else:
+            record["eligible_vehicles"] = df_vehicles[
+                (df_vehicles["max_weight_kg"] >= w) &
+                (df_vehicles["max_volume_m3"] >= v)
+            ]["vehicle_id"].tolist()
+            valid_orders.append(record)
+    # 3. Trả về toàn bộ package dữ liệu sẵn sàng "bơm" thẳng vào cell chạy mô hình tuyến
     return {
         "valid_orders": valid_orders,
         "oversized_orders": oversized_orders,
         "distance_matrix": df_dist,
-        "fleet_max_specs": {
-            "max_weight": max_w,
-            "max_volume": max_v
-        }
+        "fleet_max_specs": {"max_weight": max_w, "max_volume": max_v}
     }
-
-
 def evaluate_route_time_constraint(route_data, service_time_rules=None):
     """
     Hàm xử lý constraint thời gian tuyến (Time Windows <= 8 giờ):
-    - route_data: Dict chứa thông tin tuyến đường (danh sách khách hàng,
-      danh sách đơn hàng, tổng quãng đường, loại đơn B2C/B2B, xe vận chuyển).
-    - service_time_rules: Quy định thời gian bốc/dỡ hàng
-      (mặc định B2C: 25' load + 35' unload;
-       B2B: 45' load + 60' unload).
+    - route_data: Dict chứa thông tin tuyến đường (danh sách khách hàng, danh sách đơn hàng, tổng quãng đường, loại đơn B2C/B2B, xe vận chuyển).
+    - service_time_rules: Quy định thời gian bốc/dỡ hàng (mặc định B2C: 25' load + 35' unload; B2B: 45' load + 60' unload).
     """
-
     if service_time_rules is None:
         service_time_rules = {
-            "B2C": {"loading": 25, "unloading": 35},
-            "B2B": {"loading": 45, "unloading": 60}
+            "B2C": {"loading": 25, "unloading": 35}, # Tổng 60 phút = 1 giờ
+            "B2B": {"loading": 45, "unloading": 60}  # Tổng 105 phút = 1.75 giờ
         }
-
     # 1. Lấy thông tin từ tuyến
     orders_in_route = route_data.get("orders", [])
     total_distance_km = route_data.get("total_distance_km", 0.0)
-    vehicle_speed_kmh = route_data.get("vehicle_speed_kmh", 40.0)
-    current_date = route_data.get("current_date", "2026-04-03")
-
-    # 2. Tính Travel Time
-    travel_time_hours = (
-        total_distance_km / vehicle_speed_kmh
-        if vehicle_speed_kmh > 0 else 0.0
-    )
-
-    # 3. Tính Service Time
+    vehicle_speed_kmh = route_data.get("vehicle_speed_kmh", 40.0) # Vận tốc của xe được gán từ DIM_VEHICLE
+    current_date = route_data.get("current_date", "2026-04-03") # Ngày hiện tại của đơn
+    # 2. Tính Travel Time (giờ) = Quãng đường / Vận tốc xe
+    travel_time_hours = total_distance_km / vehicle_speed_kmh if vehicle_speed_kmh > 0 else 0.0
+    # 3. Tính Service Time (tổng thời gian bốc/dỡ cho tất cả đơn trong tuyến) (đổi ra giờ)
     total_service_minutes = 0.0
-
     for order in orders_in_route:
-        o_specs = service_time_rules.get(
-            order.get("order_type", "B2C"),
-            service_time_rules["B2C"]
-        )
-
-        total_service_minutes += (
-            o_specs["loading"] +
-            o_specs["unloading"]
-        )
-
+        o_specs = service_time_rules.get(order.get("order_type", "B2C"), service_time_rules["B2C"])
+        total_service_minutes += (o_specs["loading"] + o_specs["unloading"])
     service_time_hours = total_service_minutes / 60.0
-
-    # 4. Tổng thời gian hoàn thành tuyến
-    total_route_duration_hours = (
-        travel_time_hours +
-        service_time_hours
-    )
-
-    MAX_HOURS_ALLOWED = 8.0
+    # 4. Tổng thời gian hoàn thành tuyến (giờ)
+    total_route_duration_hours = travel_time_hours + service_time_hours
+    MAX_HOURS_ALLOWED = 8.0 # Giới hạn tối đa 8 tiếng/ngày
     result_status = {}
-
     # --- PHÂN CASE THEO YÊU CẦU ---
     if total_route_duration_hours <= MAX_HOURS_ALLOWED:
-
+        # CASE 1: Đạt yêu cầu (<= 8h)
         result_status = {
             "status": "APPROVED",
             "message": "✅ Đạt yêu cầu thời gian tuyến (<= 8h)",
             "total_hours": round(total_route_duration_hours, 2),
             "route": route_data.get("route", [])
         }
-
     else:
-
+        # Vượt quá 8h -> Phân tách 2 kịch bản phụ theo yêu cầu
+        # Kịch bản phụ A: Đẩy đơn/khách vi phạm quay trở lại pool hàng để thuật toán Clarke-Wright tiếp tục gom nhóm lại vào tuyến khác.
+        # Kịch bản phụ B: Backlog sang ngày hôm sau (tính số ngày backlog, lưu vết nguồn gốc ngày ban đầu) và chạy ngầm sang pool ngày hôm sau.
+        # Ở đây ta đánh dấu cờ backlog và ghi nhận nguồn gốc ngày
         backlog_orders = []
-
         for order in orders_in_route:
             order_backlog_info = order.copy()
-
-            order_backlog_info["backlog_days_count"] = (
-                order.get("backlog_days_count", 0) + 1
-            )
-
-            order_backlog_info["original_date"] = (
-                order.get("original_date", current_date)
-            )
-
-            order_backlog_info["backlog_reason"] = (
-                f"Tuyến vượt quá 8h ({total_route_duration_hours:.2f}h)"
-            )
-
+            order_backlog_info["backlog_days_count"] = order.get("backlog_days_count", 0) + 1
+            order_backlog_info["original_date"] = order.get("original_date", current_date)
+            order_backlog_info["backlog_reason"] = f"Tuyến vượt quá 8h ({total_route_duration_hours:.2f}h)"
             backlog_orders.append(order_backlog_info)
-
         result_status = {
             "status": "BACKLOG_OR_REPOOL",
-            "message": (
-                "⚠️ Tuyến vượt quá giới hạn 8h! "
-                "Đẩy đơn sang pool xử lý ngầm "
-                "(Backlog ngày tiếp theo / Tái gộp Clarke-Wright)"
-            ),
+            "message": "⚠️ Tuyến vượt quá giới hạn 8h! Đẩy đơn sang pool xử lý ngầm (Backlog ngày tiếp theo / Tái gộp Clarke-Wright)",
             "total_hours": round(total_route_duration_hours, 2),
-            "repool_orders": orders_in_route,
-            "backlog_orders_next_day": backlog_orders
+            "repool_orders": orders_in_route, # Đẩy lại vào pool cho Clarke-Wright
+            "backlog_orders_next_day": backlog_orders # Backlog chạy ngầm sang ngày mai kèm đếm số ngày backlog
         }
-
     return result_status
+
+
 # ============================================================================
 # CLARKE-WRIGHT SAVINGS: RoutePlanner + simulate_all
 # ============================================================================
@@ -2008,92 +1633,41 @@ class RoutePlanner:
         self.dist_df = data["dist"]
         self.cust = data["cust"]
         self.wh = data["warehouses"]
-
-        # Catalog chỉ dùng để xác định năng lực xe theo WEIGHT + VOLUME.
-        # Max_Distance KHÔNG được đưa vào catalog hay Clarke-Wright.
         cat = (self.veh.groupby("vehicle_type")
-               .agg(
-                   w=("max_weight_kg", "max"),
-                   v=("max_volume_m3", "max"),
-                   speed=("speed_kmh", "first"),
-                   fixed=("fixed_cost", "first"),
-                   var=("variable_cost_per_km", "first")
-               )
-               .sort_values(["w", "v"]))
+               .agg(w=("max_weight_kg", "max"), v=("max_volume_m3", "max"), speed=("speed_kmh", "first"),
+                    fixed=("fixed_cost", "first"), var=("variable_cost_per_km", "first"))
+               .sort_values("w"))
         self.catalog = cat
-        self.max_w = float(cat["w"].max()) if not cat.empty else 1000.0
-        self.max_v = float(cat["v"].max()) if not cat.empty else 5.0
-
+        self.max_w = cat["w"].max() if not cat.empty else 1000.0
+        self.max_v = cat["v"].max() if not cat.empty else 5.0
     def _hav(self, a, b) -> float:
         return haversine(a["lat"], a["lon"], b["lat"], b["lon"]) * self.cfg.detour_factor
-
     def d_cc(self, i, j) -> float:
         if i in self.dist_df.index and j in self.dist_df.columns:
             return float(self.dist_df.loc[i, j])
         return self._hav(self.cust[i], self.cust[j]) if (i in self.cust and j in self.cust) else 10.0
-
     def d_wc(self, wh_id, c) -> float:
         return self._hav(self.wh[wh_id], self.cust[c]) if (wh_id in self.wh and c in self.cust) else 10.0
-
     def nearest_wh(self, c) -> str:
         return min(self.wh, key=lambda w: self.d_wc(w, c))
-
     def fit_type(self, w, v):
-        """Chọn loại xe nhỏ nhất đủ Weight + Volume; không xét Max_Distance."""
-        if self.catalog.empty:
-            return "Truck"
+        if self.catalog.empty: return "Truck"
         ok = self.catalog[(self.catalog["w"] >= w) & (self.catalog["v"] >= v)]
         return ok.index[0] if not ok.empty else self.catalog.index[-1]
-
     def km(self, route, wh_id) -> float:
-        if not route:
-            return 0.0
-        return (
-            self.d_wc(wh_id, route[0])
-            + self.d_wc(wh_id, route[-1])
-            + sum(self.d_cc(a, b) for a, b in zip(route, route[1:]))
-        )
-
+        if not route: return 0.0
+        return self.d_wc(wh_id, route[0]) + self.d_wc(wh_id, route[-1]) + sum(self.d_cc(a, b) for a, b in zip(route, route[1:]))
     def metrics(self, route, wh_id, demand):
-        """Tính tải trọng tuyến + quãng đường + thời gian.
-
-        Max_Distance không được tính là constraint ở đây.
-        """
         w = sum(demand[c]["weight"] for c in route)
         v = sum(demand[c]["volume"] for c in route)
         km = self.km(route, wh_id)
         vtype = self.fit_type(w, v)
         speed = self.catalog.loc[vtype, "speed"] if vtype in self.catalog.index else 35.0
-        service = sum(
-            self.cfg.service_min.get(demand[c]["order_type"], 60)
-            for c in route
-        ) / 60
-        return {
-            "w": w,
-            "v": v,
-            "km": km,
-            "hours": km / speed + service,
-            "vtype": vtype,
-            "speed": speed,
-        }
-
+        service = sum(self.cfg.service_min.get(demand[c]["order_type"], 60) for c in route) / 60
+        return {"w": w, "v": v, "km": km, "hours": km / speed + service, "vtype": vtype, "speed": speed}
     def feasible(self, route, wh_id, demand) -> bool:
-        """Constraint dùng NGAY TRONG Clarke-Wright.
-
-        Chỉ gồm:
-          1. Tổng Weight <= sức chứa Weight xe lớn nhất.
-          2. Tổng Volume <= sức chứa Volume xe lớn nhất.
-          3. Thời gian tuyến <= max_route_hours.
-
-        KHÔNG xét Max_Distance tại đây.
-        """
         m = self.metrics(route, wh_id, demand)
-        return (
-            m["w"] <= self.max_w + 1e-9
-            and m["v"] <= self.max_v + 1e-9
-            and m["hours"] <= self.cfg.max_route_hours + 1e-9
-        )
-
+        return (m["w"] <= self.max_w and m["v"] <= self.max_v and m["hours"] <= self.cfg.max_route_hours)
     def two_opt(self, route, wh_id):
         best, improved = route[:], True
         while improved and len(best) > 2:
@@ -2104,108 +1678,45 @@ class RoutePlanner:
                     if self.km(cand, wh_id) < self.km(best, wh_id) - 1e-9:
                         best, improved = cand, True
         return best
-
     def clarke_wright(self, custs, wh_id, demand):
-        """Clarke-Wright với constraint tải trọng ngay trong bước merge.
-
-        Mạch tư duy:
-            Đơn hàng
-              -> aggregate theo customer
-              -> Savings
-              -> thử merge
-              -> Weight + Volume + Time screening
-              -> route hợp lệ mới được merge
-              -> 2-opt sau cùng
-
-        Max_Distance KHÔNG được dùng để cấm merge.
-        Max_Distance chỉ được xét sau khi route đã hoàn tất, tại _build_route().
-        """
         route_of = {c: [c] for c in custs}
         savings = sorted(
-            (
-                (
-                    self.d_wc(wh_id, a)
-                    + self.d_wc(wh_id, b)
-                    - self.d_cc(a, b),
-                    a,
-                    b,
-                )
-                for k, a in enumerate(custs)
-                for b in custs[k + 1:]
-            ),
-            reverse=True,
-        )
-
+            ((self.d_wc(wh_id, a) + self.d_wc(wh_id, b) - self.d_cc(a, b), a, b)
+             for k, a in enumerate(custs) for b in custs[k + 1:]),
+            reverse=True)
         for s, a, b in savings:
-            if s <= 0:
-                break
-
+            if s <= 0: break
             ra, rb = route_of[a], route_of[b]
-            if ra is rb:
-                continue
-            if a not in (ra[0], ra[-1]) or b not in (rb[0], rb[-1]):
-                continue
-
+            if ra is rb or a not in (ra[0], ra[-1]) or b not in (rb[0], rb[-1]): continue
             ra = ra if ra[-1] == a else ra[::-1]
             rb = rb if rb[0] == b else rb[::-1]
             merged = ra + rb
-
-            # ĐÂY là nơi constraint tải trọng được đưa vào Clarke-Wright.
-            # Không thêm Max_Distance vào điều kiện này.
             if self.feasible(merged, wh_id, demand):
-                for c in merged:
-                    route_of[c] = merged
-
+                for c in merged: route_of[c] = merged
         uniq = {id(r): r for r in route_of.values()}.values()
         return [self.two_opt(r, wh_id) for r in uniq]
-
     def plan_day(self, date_str: str, day_orders: list) -> dict:
         cfg = self.cfg
-        res = {
-            "routes": [],
-            "overdue_routes": [],
-            "exceptions": [],
-            "carried_orders": [],
-            "overdue_backlog_list": [],
-            "day_cost": 0.0,
-            "penalty_cost": 0.0,
-        }
+        res = {"routes": [], "overdue_routes": [], "exceptions": [], "carried_orders": [], "overdue_backlog_list": [], "day_cost": 0.0, "penalty_cost": 0.0}
         date = pd.to_datetime(date_str)
-
-        def waiting(o):
-            return (date - pd.to_datetime(o["WAITING_DATE"])).days if o["WAITING_DATE"] else 0
-
+        def waiting(o): return (date - pd.to_datetime(o["WAITING_DATE"])).days if o["WAITING_DATE"] else 0
         def exc(sev, o, kind, detail, handled, propose):
-            res["exceptions"].append({
-                "NGÀY": date_str,
-                "MỨC ĐỘ": sev,
-                "MÃ ĐƠN": o["ORDER_ID"],
-                "PHÂN LOẠI": kind,
-                "CHI TIẾT": detail,
-                "ĐÃ XỬ LÝ": handled,
-                "ĐỀ XUẤT": propose,
-            })
-
+            res["exceptions"].append({"NGÀY": date_str, "MỨC ĐỘ": sev, "MÃ ĐƠN": o["ORDER_ID"], "PHÂN LOẠI": kind, "CHI TIẾT": detail, "ĐÃ XỬ LÝ": handled, "ĐỀ XUẤT": propose})
         normal, overdue = [], []
         for o in day_orders:
             if o["customer_id"] not in self.cust:
-                exc(
-                    "MEDIUM", o, "THIẾU TỌA ĐỘ",
-                    "Không tìm thấy khách hàng", "Bỏ qua", "Bổ sung tọa độ"
-                )
+                exc("MEDIUM", o, "THIẾU TỌA ĐỘ", "Không tìm thấy khách hàng", "Bỏ qua", "Bổ sung tọa độ")
+                res["carried_orders"].append(o)
+            elif o["weight"] > self.max_w or o["volume"] > self.max_v:
+                exc("CRITICAL", o, "ĐƠN QUÁ CỠ", f"{o['weight']:.0f}kg vượt xe lớn nhất", "Tách riêng", "Thuê xe lớn")
                 res["carried_orders"].append(o)
             else:
                 (overdue if waiting(o) > 1 else normal).append(o)
-
         res["overdue_backlog_list"] = overdue
         pool = {i: r for i, r in self.veh.iterrows()}
         driver_pointers = {w: {"c": 0, "p": 0} for w in self.wh}
-
         def assign_driver(wh_id):
-            d_info = self.drivers.get(
-                wh_id,
-                {"chính": ["Tài xế chính"], "phụ": ["Phụ xe"]}
-            )
+            d_info = self.drivers.get(wh_id, {"chính": ["Tài xế chính"], "phụ": ["Phụ xe"]})
             c_list, p_list = d_info["chính"], d_info["phụ"]
             idx_c, idx_p = driver_pointers[wh_id]["c"], driver_pointers[wh_id]["p"]
             if idx_c < len(c_list):
@@ -2218,347 +1729,53 @@ class RoutePlanner:
             assistant = p_list[idx_p % len(p_list)] if p_list else "Phụ xe"
             driver_pointers[wh_id]["p"] += 1
             return primary, assistant, backup
-
         for bucket, target in ((overdue, res["overdue_routes"]), (normal, res["routes"])):
             by_wh = {}
-            for o in bucket:
-                by_wh.setdefault(self.nearest_wh(o["customer_id"]), []).append(o)
-
+            for o in bucket: by_wh.setdefault(self.nearest_wh(o["customer_id"]), []).append(o)
             for wh_id, ords in by_wh.items():
                 demand, by_cust = {}, {}
                 for o in ords:
-                    d = demand.setdefault(
-                        o["customer_id"],
-                        {"weight": 0, "volume": 0, "order_type": o["order_type"]}
-                    )
-                    d["weight"] += o["weight"]
-                    d["volume"] += o["volume"]
+                    d = demand.setdefault(o["customer_id"], {"weight": 0, "volume": 0, "order_type": o["order_type"]})
+                    d["weight"] += o["weight"]; d["volume"] += o["volume"]
                     by_cust.setdefault(o["customer_id"], []).append(o)
-
-                # Weight + Volume + Time được đưa vào Clarke-Wright.
-                # Max_Distance chỉ xuất hiện ở _build_route().
                 routes = self.clarke_wright(list(demand), wh_id, demand)
-
                 for rt in routes:
-                    target.extend(
-                        self._build_route(
-                            rt, wh_id, demand, by_cust,
-                            pool, assign_driver, date_str
-                        )
-                    )
-
+                    target.append(self._build_route(rt, wh_id, demand, by_cust, pool, assign_driver, date_str))
         for r in res["routes"] + res["overdue_routes"]:
-            res["day_cost"] += (
-                r["fixed_cost"]
-                + r["variable_cost"]
-                + r["overnight_cost"]
-                + r["driver_cost"]
-            )
-
-        res["penalty_cost"] = sum(
-            max(waiting(o), 0) for o in overdue
-        ) * cfg.late_penalty_per_day
+            res["day_cost"] += r["fixed_cost"] + r["variable_cost"] + r["overnight_cost"] + r["driver_cost"]
+        res["penalty_cost"] = sum(max(waiting(o), 0) for o in overdue) * cfg.late_penalty_per_day
         return res
-
-    def _saving_service_prices(self):
-        """Lấy giá giao hàng tiết kiệm từ Config nếu đã khai báo.
-
-        Hỗ trợ các tên cấu hình phổ biến; nếu bản Config hiện tại chưa có,
-        giữ fallback cũ để code không bị vỡ.
-        """
-        ghtk_price = getattr(self.cfg, "ghtk_price", 100_000)
-        tier2_price = getattr(self.cfg, "saving_tier2_price", 500_000)
-        return float(ghtk_price), float(tier2_price)
-
     def _build_route(self, route, wh_id, demand, by_cust, pool, assign_driver, date_str):
         cfg = self.cfg
         m = self.metrics(route, wh_id, demand)
-        max_w = self.max_w
-        max_v = self.max_v
-
-        def make_route(
-            route_part, vrow=None, external=True, vid=None, plate=None,
-            vtype=None, speed=None, fx=0.0, vr=0.0
-        ):
-            mm = self.metrics(route_part, wh_id, demand)
-            primary, assistant, backup = assign_driver(wh_id)
-            km, hours = mm["km"], mm["hours"]
-            start = dt.datetime.combine(
-                pd.to_datetime(date_str).date(),
-                dt.datetime.strptime(cfg.start_time, "%H:%M").time()
-            )
-
-            max_v_val = (
-                vrow["max_volume_m3"]
-                if vrow is not None
-                else (
-                    self.catalog.loc[vtype, "v"]
-                    if vtype in self.catalog.index
-                    else mm["v"]
-                )
-            )
-            load_f = mm["v"] / max_v_val if max_v_val > 0 else 0.5
-
-            return {
-                "kind": "NORMAL",
-                "wh_id": wh_id,
-                "route": list(route_part),
-                "orders": [o for c in route_part for o in by_cust[c]],
-                "vehicle_id": vid,
-                "license_plate": plate,
-                "vehicle_type": vtype,
-                "external": external,
-                "driver_primary": primary,
-                "driver_assistant": assistant,
-                "is_backup_driver": backup,
-                "km": round(km, 1),
-                "speed_kmh": speed if speed is not None else mm["speed"],
-                "load_factor": min(max(load_f, 0.15), 1.0),
-                "fixed_cost": fx,
-                "variable_cost": vr * km,
-                "overnight_cost": 0.0,
-                "driver_cost": cfg.backup_driver_cost if backup else 0.0,
-                "cut_orders": [],
-                "start": start,
-                "end": start + dt.timedelta(hours=hours),
-                "hours": hours,
-            }
-
-        # ==================================================================
-        # BƯỚC 1 — ROUTE ĐÃ ĐƯỢC CLARKE-WRIGHT KIỂM TRA WEIGHT + VOLUME.
-        # ==================================================================
-        # Nếu route vẫn vượt sức chứa xe lớn nhất thì không thể dùng đội xe nhà.
-        # Trường hợp này thuê ngoài ngay, KHÔNG chia 2 xe nhà.
-        oversized_max = (
-            m["w"] > max_w + 1e-9
-            or m["v"] > max_v + 1e-9
-        )
-
-        if oversized_max:
-            if m["km"] <= 50:
-                fx, vr = 900_000, 20_000
-                label = "Thuê ngoài <=50km: mở cửa 900.000đ + 20.000đ/km"
-            else:
-                fx, vr = 1_200_000, 25_000
-                label = "Thuê ngoài >50km: mở cửa 1.200.000đ + 25.000đ/km"
-
-            return [make_route(
-                route,
-                external=True,
-                vid="3PL-OVERSIZE",
-                plate=label,
-                vtype="Thuê ngoài",
-                speed=35.0,
-                fx=fx,
-                vr=vr,
-            )]
-
-        # ==================================================================
-        # BƯỚC 2 — TÌM XE NHÀ ĐỦ WEIGHT + VOLUME.
-        # ==================================================================
-        # Max_Distance CHƯA được xét ở bước này.
-        cands = [
-            (i, r) for i, r in pool.items()
-            if r["wh_id"] == wh_id
-            and r["max_weight_kg"] >= m["w"]
-            and r["max_volume_m3"] >= m["v"]
-        ]
-        cands = sorted(
-            cands,
-            key=lambda t: (
-                t[1]["max_volume_m3"],
-                t[1]["max_weight_kg"]
-            )
-        )
-
-        # ==================================================================
-        # BƯỚC 3 — CHỈ SAU KHI XE ĐỦ TẢI MỚI XÉT Max_Distance.
-        # ==================================================================
+        cands = [(i, r) for i, r in pool.items() if r["wh_id"] == wh_id and r["max_weight_kg"] >= m["w"] and r["max_volume_m3"] >= m["v"]]
         if cands:
-            for idx, vrow in cands:
-                max_distance = pd.to_numeric(
-                    vrow.get("Max_Distance", np.nan),
-                    errors="coerce"
-                )
-                if pd.isna(max_distance):
-                    # Không có Max_Distance -> không tự ý loại xe.
-                    distance_ok = True
-                else:
-                    distance_ok = m["km"] <= float(max_distance) + 1e-9
-
-                if distance_ok:
-                    pool.pop(idx)
-                    return [make_route(
-                        route,
-                        vrow=vrow,
-                        external=False,
-                        vid=vrow["vehicle_id"],
-                        plate=vrow["license_plate"],
-                        vtype=vrow["vehicle_type"],
-                        speed=vrow["speed_kmh"],
-                        fx=vrow["fixed_cost"],
-                        vr=vrow["variable_cost_per_km"],
-                    )]
-
-            # ==============================================================
-            # Tất cả xe đủ Weight + Volume nhưng đều vượt Max_Distance.
-            # LÚC NÀY mới được xét giao hàng tiết kiệm.
-            # ==============================================================
-            ghtk_price, tier2_price = self._saving_service_prices()
-
-            # Case 1: <20kg và <0.6m3
-            if m["w"] < 20 and m["v"] < 0.6:
-                return [make_route(
-                    route,
-                    external=True,
-                    vid="GHTK",
-                    plate="GHTK",
-                    vtype="GHTK",
-                    speed=35.0,
-                    fx=ghtk_price,
-                    vr=0.0,
-                )]
-
-            # Case 2: không đạt case 1 nhưng <100kg và <3m3
-            if m["w"] < 100 and m["v"] < 3:
-                return [make_route(
-                    route,
-                    external=True,
-                    vid="DỊCH VỤ TIẾT KIỆM",
-                    plate="Dịch vụ giao hàng tiết kiệm",
-                    vtype="Dịch vụ giao hàng tiết kiệm",
-                    speed=35.0,
-                    fx=tier2_price,
-                    vr=0.0,
-                )]
-
-        # ==================================================================
-        # BƯỚC 4 — KHÔNG ĐẠT 2 CASE GIAO HÀNG TIẾT KIỆM.
-        #         DÙNG 2 XE NHÀ: XE LỚN NHẤT + XE LỚN THỨ NHÌ.
-        # ==================================================================
-        pair_pool = [
-            (i, r) for i, r in pool.items()
-            if r["wh_id"] == wh_id
-        ]
-        pair_pool = sorted(
-            pair_pool,
-            key=lambda t: (
-                t[1]["max_volume_m3"],
-                t[1]["max_weight_kg"]
-            ),
-            reverse=True
-        )
-
-        # Đúng yêu cầu: ưu tiên đúng 2 xe lớn nhất + nhì.
-        if len(pair_pool) >= 2:
-            i1, v1 = pair_pool[0]
-            i2, v2 = pair_pool[1]
-
-            def split_two_vehicle_route(v1, v2):
-                caps = [
-                    (
-                        float(v1["max_weight_kg"]),
-                        float(v1["max_volume_m3"])
-                    ),
-                    (
-                        float(v2["max_weight_kg"]),
-                        float(v2["max_volume_m3"])
-                    )
-                ]
-
-                groups = [[], []]
-                loads = [[0.0, 0.0], [0.0, 0.0]]
-
-                ordered = sorted(
-                    route,
-                    key=lambda c: max(
-                        demand[c]["weight"] / caps[0][0] if caps[0][0] else 999,
-                        demand[c]["volume"] / caps[0][1] if caps[0][1] else 999,
-                        demand[c]["weight"] / caps[1][0] if caps[1][0] else 999,
-                        demand[c]["volume"] / caps[1][1] if caps[1][1] else 999,
-                    ),
-                    reverse=True
-                )
-
-                for c in ordered:
-                    w = demand[c]["weight"]
-                    v = demand[c]["volume"]
-                    feasible_bins = [
-                        b for b in (0, 1)
-                        if loads[b][0] + w <= caps[b][0] + 1e-9
-                        and loads[b][1] + v <= caps[b][1] + 1e-9
-                    ]
-                    if not feasible_bins:
-                        return None
-
-                    b = min(
-                        feasible_bins,
-                        key=lambda x: max(
-                            (loads[x][0] + w) / caps[x][0] if caps[x][0] else 999,
-                            (loads[x][1] + v) / caps[x][1] if caps[x][1] else 999,
-                        )
-                    )
-                    groups[b].append(c)
-                    loads[b][0] += w
-                    loads[b][1] += v
-
-                sets = [set(groups[0]), set(groups[1])]
-                parts = [
-                    [c for c in route if c in sets[0]],
-                    [c for c in route if c in sets[1]],
-                ]
-
-                if not parts[0] or not parts[1]:
-                    return None
-
-                # Hai phần vẫn phải thỏa constraint thời gian tuyến.
-                # Max_Distance KHÔNG được dùng ở đây vì route đã đi qua
-                # nhánh "tất cả xe đơn đều vượt Max_Distance".
-                for part in parts:
-                    mm = self.metrics(part, wh_id, demand)
-                    if mm["w"] > max_w + 1e-9 or mm["v"] > max_v + 1e-9:
-                        return None
-                    if mm["hours"] > cfg.max_route_hours + 1e-9:
-                        return None
-
-                return parts
-
-            parts = split_two_vehicle_route(v1, v2)
-            if parts is not None:
-                pool.pop(i1)
-                pool.pop(i2)
-                return [
-                    make_route(
-                        part,
-                        vrow=vrow,
-                        external=False,
-                        vid=vrow["vehicle_id"],
-                        plate=vrow["license_plate"],
-                        vtype=vrow["vehicle_type"],
-                        speed=vrow["speed_kmh"],
-                        fx=vrow["fixed_cost"],
-                        vr=vrow["variable_cost_per_km"],
-                    )
-                    for part, vrow in zip(parts, (v1, v2))
-                ]
-
-        # ==================================================================
-        # BƯỚC 5 — FALLBACK OUTSOURCE GIỮ NGUYÊN LOGIC CŨ.
-        # ==================================================================
-        vt = m["vtype"] if m["vtype"] in self.catalog.index else (
-            self.catalog.index[-1] if not self.catalog.empty else "Truck"
-        )
-        return [make_route(
-            route,
-            external=True,
-            vid=f"3PL-{vt}",
-            plate="Thuê ngoài 3PL",
-            vtype=vt,
-            speed=self.catalog.loc[vt, "speed"] if vt in self.catalog.index else 35.0,
-            fx=self.catalog.loc[vt, "fixed"] if vt in self.catalog.index else 300_000,
-            vr=self.catalog.loc[vt, "var"] if vt in self.catalog.index else 8_000,
-        )]
-
+            idx, vrow = min(cands, key=lambda t: (t[1]["max_weight_kg"], t[1]["max_volume_m3"]))
+            pool.pop(idx)
+            external = False
+            vid, plate, vtype = vrow["vehicle_id"], vrow["license_plate"], vrow["vehicle_type"]
+            speed, fx, vr = vrow["speed_kmh"], vrow["fixed_cost"], vrow["variable_cost_per_km"]
+        else:
+            vt = m["vtype"] if m["vtype"] in self.catalog.index else (self.catalog.index[-1] if not self.catalog.empty else "Truck")
+            external = True
+            vid, plate, vtype = f"3PL-{vt}", "Thuê ngoài 3PL (Hết xe nhà)", vt
+            speed = self.catalog.loc[vt, "speed"] if vt in self.catalog.index else 35.0
+            fx = self.catalog.loc[vt, "fixed"] if vt in self.catalog.index else 300_000
+            vr = self.catalog.loc[vt, "var"] if vt in self.catalog.index else 8_000
+        primary, assistant, backup = assign_driver(wh_id)
+        km, hours = m["km"], m["hours"]
+        start = dt.datetime.combine(pd.to_datetime(date_str).date(), dt.datetime.strptime(cfg.start_time, "%H:%M").time())
+        max_w_val = self.catalog.loc[vtype, "w"] if vtype in self.catalog.index else m["w"]
+        load_f = m["w"] / max_w_val if max_w_val > 0 else 0.5
+        return {
+            "kind": "NORMAL", "wh_id": wh_id, "route": list(route), "orders": [o for c in route for o in by_cust[c]],
+            "vehicle_id": vid, "license_plate": plate, "vehicle_type": vtype, "external": external,
+            "driver_primary": primary, "driver_assistant": assistant, "is_backup_driver": backup,
+            "km": round(km, 1), "speed_kmh": speed, "load_factor": min(max(load_f, 0.15), 1.0),
+            "fixed_cost": fx, "variable_cost": vr * km, "overnight_cost": 0.0,
+            "driver_cost": cfg.backup_driver_cost if backup else 0.0,
+            "cut_orders": [], "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours,
+        }
 def simulate_all(data: dict, cfg: Config = CFG):
     planner = RoutePlanner(data, cfg)
     by_date = {}
