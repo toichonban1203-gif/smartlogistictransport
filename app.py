@@ -1620,7 +1620,6 @@ def evaluate_route_time_constraint(route_data, service_time_rules=None):
         }
     return result_status
 
-
 # ============================================================================
 # CLARKE-WRIGHT SAVINGS: RoutePlanner + simulate_all
 # ============================================================================
@@ -1707,9 +1706,9 @@ class RoutePlanner:
             if o["customer_id"] not in self.cust:
                 exc("MEDIUM", o, "THIẾU TỌA ĐỘ", "Không tìm thấy khách hàng", "Bỏ qua", "Bổ sung tọa độ")
                 res["carried_orders"].append(o)
-            elif o["weight"] > self.max_w or o["volume"] > self.max_v:
-                exc("CRITICAL", o, "ĐƠN QUÁ CỠ", f"{o['weight']:.0f}kg vượt xe lớn nhất", "Tách riêng", "Thuê xe lớn")
-                res["carried_orders"].append(o)
+            elif o["weight"] > 1.5 * self.max_w or o["volume"] > 1.5 * self.max_v:
+                exc("CRITICAL", o, "ĐƠN QUÁ CỠ", f"{o['weight']:.0f}kg hoặc {o['volume']:.2f}m³ vượt 150% xe lớn nhất", "Outsource", "Thuê ngoài 30.000đ/km")
+                (overdue if waiting(o) > 1 else normal).append(o)
             else:
                 (overdue if waiting(o) > 1 else normal).append(o)
         res["overdue_backlog_list"] = overdue
@@ -1748,20 +1747,72 @@ class RoutePlanner:
     def _build_route(self, route, wh_id, demand, by_cust, pool, assign_driver, date_str):
         cfg = self.cfg
         m = self.metrics(route, wh_id, demand)
-        cands = [(i, r) for i, r in pool.items() if r["wh_id"] == wh_id and r["max_weight_kg"] >= m["w"] and r["max_volume_m3"] >= m["v"]]
-        if cands:
-            idx, vrow = min(cands, key=lambda t: (t[1]["max_weight_kg"], t[1]["max_volume_m3"]))
-            pool.pop(idx)
-            external = False
-            vid, plate, vtype = vrow["vehicle_id"], vrow["license_plate"], vrow["vehicle_type"]
-            speed, fx, vr = vrow["speed_kmh"], vrow["fixed_cost"], vrow["variable_cost_per_km"]
-        else:
+        max_w = self.max_w
+        max_v = self.max_v
+
+        # 1) Đơn quá cỡ: chỉ outsource khi vượt quá 150% xe lớn nhất
+        oversized_150 = m["w"] > 1.5 * max_w or m["v"] > 1.5 * max_v
+
+        if oversized_150:
             vt = m["vtype"] if m["vtype"] in self.catalog.index else (self.catalog.index[-1] if not self.catalog.empty else "Truck")
             external = True
-            vid, plate, vtype = f"3PL-{vt}", "Thuê ngoài 3PL (Hết xe nhà)", vt
+            vid, plate, vtype = f"3PL-{vt}", "Thuê ngoài 3PL (>150% xe lớn nhất)", vt
             speed = self.catalog.loc[vt, "speed"] if vt in self.catalog.index else 35.0
-            fx = self.catalog.loc[vt, "fixed"] if vt in self.catalog.index else 300_000
-            vr = self.catalog.loc[vt, "var"] if vt in self.catalog.index else 8_000
+            fx = 0.0
+            vr = 30_000
+
+        else:
+            # 2) Vòng 1: quét đội xe nhà theo đúng 2 constraint tải trọng + thể tích
+            #    và số lượng xe còn lại. Chưa xét distance ở vòng này.
+            cands = [
+                (i, r) for i, r in pool.items()
+                if r["wh_id"] == wh_id
+                and r["max_weight_kg"] >= m["w"]
+                and r["max_volume_m3"] >= m["v"]
+            ]
+
+            # Xe nhỏ nhất khả thi được xét trước; distance sẽ được kiểm tra
+            # lần lượt trên toàn bộ danh sách xe đã qua vòng capacity.
+            cands = sorted(
+                cands,
+                key=lambda t: (t[1]["max_volume_m3"], t[1]["max_weight_kg"])
+            )
+
+            selected = None
+            for idx, vrow in cands:
+                max_distance = float(vrow["max_distance"])
+                if m["km"] <= max_distance:
+                    selected = (idx, vrow)
+                    break
+
+            if selected is not None:
+                # 3) Có xe vừa đủ tải/thể tích vừa đủ distance -> lấy xe nhỏ nhất khả thi.
+                idx, vrow = selected
+                pool.pop(idx)
+                external = False
+                vid, plate, vtype = vrow["vehicle_id"], vrow["license_plate"], vrow["vehicle_type"]
+                speed, fx, vr = vrow["speed_kmh"], vrow["fixed_cost"], vrow["variable_cost_per_km"]
+
+            else:
+                # 4) Không có xe nhà vừa đủ capacity + distance:
+                #    xét các phương án giao hàng thay thế theo đúng thứ tự.
+                if m["w"] < 20 and m["v"] < 0.6:
+                    external = True
+                    vid, plate, vtype = "GHTK", "GHTK", "GHTK"
+                    speed, fx, vr = 35.0, 100_000, 0.0
+                elif m["w"] < 100 and m["v"] < 3:
+                    external = True
+                    vid, plate, vtype = "DỊCH VỤ 500K", "Dịch vụ giao hàng", "Dịch vụ giao hàng"
+                    speed, fx, vr = 35.0, 500_000, 0.0
+                else:
+                    # Ngoài 2 nhóm trên -> giữ fallback outsource hiện tại.
+                    vt = m["vtype"] if m["vtype"] in self.catalog.index else (self.catalog.index[-1] if not self.catalog.empty else "Truck")
+                    external = True
+                    vid, plate, vtype = f"3PL-{vt}", "Thuê ngoài 3PL", vt
+                    speed = self.catalog.loc[vt, "speed"] if vt in self.catalog.index else 35.0
+                    fx = self.catalog.loc[vt, "fixed"] if vt in self.catalog.index else 300_000
+                    vr = self.catalog.loc[vt, "var"] if vt in self.catalog.index else 8_000
+
         primary, assistant, backup = assign_driver(wh_id)
         km, hours = m["km"], m["hours"]
         start = dt.datetime.combine(pd.to_datetime(date_str).date(), dt.datetime.strptime(cfg.start_time, "%H:%M").time())
@@ -1776,6 +1827,7 @@ class RoutePlanner:
             "driver_cost": cfg.backup_driver_cost if backup else 0.0,
             "cut_orders": [], "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours,
         }
+
 def simulate_all(data: dict, cfg: Config = CFG):
     planner = RoutePlanner(data, cfg)
     by_date = {}
