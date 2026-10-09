@@ -266,6 +266,9 @@ def render_result(prefix, title):
 # ============================================================================
 # 🚚 TAB 1: FLEET (HẠM ĐỘI XE)
 # ============================================================================
+# ============================================================================
+# 🚚 TAB 1: FLEET (HẠM ĐỘI XE) — TOÀN BỘ HOÀN CHỈNH
+# ============================================================================
 VEHICLE_FIELDS = {
     "vehicle_id": ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"],
     "license_plate": ["biển số", "bien so", "bsx", "license plate", "plate", "số xe", "so xe"],
@@ -277,19 +280,22 @@ VEHICLE_FIELDS = {
     "fixed_cost": ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"],
     "variable_cost": ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"],
 }
+
 VEHICLE_NUMERIC = ["max_weight_kg", "max_volume_m3", "average_speed_kmh", "Max_Distance", "fixed_cost", "variable_cost"]
 
 def fleet_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
-    if values.empty: return 0.0
+    if values.empty:
+        return 0.0
     if field in VEHICLE_NUMERIC:
         return float(values.str.replace(r"[^\d.]", "", regex=True).str.len().gt(0).mean())
     return float(values.nunique() / len(values))
 
 def process_vehicle(rec):
     out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["vehicle_id", "license_plate", "id_warehouse"]}
-    for f in VEHICLE_NUMERIC: out[f] = parse_num(rec.get(f))
+    for f in VEHICLE_NUMERIC:
+        out[f] = parse_num(rec.get(f))
     out["trạng_thái"] = "✅ Hợp lệ"
     return out
 
@@ -311,27 +317,46 @@ def fleet_validate_output(df):
 
 def fleet_empty_table():
     return pd.DataFrame({
-        "vehicle_id": ["VEH_01", "VEH_02"], "license_plate": ["29C-123.45", "29C-678.90"],
-        "id_warehouse": ["WH_HN_01", "WH_HN_01"], "max_weight_kg": [5000, 2000],
-        "max_volume_m3": [20, 10], "average_speed_kmh": [50, 45],
-        "Max_Distance": [80, 100], "fixed_cost": [500000, 300000], "variable_cost": [5000, 4000],
+        "vehicle_id": ["VEH_01", "VEH_02"], 
+        "license_plate": ["29C-123.45", "29C-678.90"],
+        "id_warehouse": ["WH_HN_01", "WH_HN_01"], 
+        "max_weight_kg": [5000, 2000],
+        "max_volume_m3": [20, 10], 
+        "average_speed_kmh": [50, 45],
+        "Max_Distance": [80, 100],  # Đã tích hợp đầy đủ cột Max_Distance
+        "fixed_cost": [500000, 300000], 
+        "variable_cost": [5000, 4000],
     })
 
 def render_fleet_tab():
     st.header("🚚 Quản lý Hạm đội Xe (Fleet)")
+    st.markdown("**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**")
+    
     mode, edited, uploaded = render_input_block("fleet", "phương tiện", fleet_empty_table())
+    
     if st.button("🔍 Quét & Semantic Mapping", key="fleet_scan", type="primary"):
         run_scan("fleet", "phương tiện", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, VEHICLE_FIELDS, fleet_profile_score, 0.35))
+    
     raw = st.session_state.get("fleet_raw")
-    if raw is None: return
+    if raw is None: 
+        return
+        
+    st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_VEHICLE`)")
+    
     chosen = render_mapping("fleet", list(VEHICLE_FIELDS), raw)
+    
     if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
-        colmap = build_colmap(raw, chosen)
-        rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw.iterrows()]
-        out = fleet_validate_output(pd.DataFrame(rows))
-        files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
-        ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
-        store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
+        try:
+            colmap = build_colmap(raw, chosen)
+            rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw.iterrows()]
+            out = fleet_validate_output(pd.DataFrame(rows))
+            files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
+            ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
+            store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
+        except Exception as exc:
+            st.error(f"❌ Lỗi chi tiết: {exc}")
+            
     render_result("fleet", "📊 Kết quả Hạm đội")
 
 # ============================================================================
