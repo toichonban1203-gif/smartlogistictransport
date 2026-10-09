@@ -260,13 +260,16 @@ def render_result(prefix, title):
     st.caption(f"🧠 RAM kết quả: {mem_kb(res['df']):,.1f} KB (gốc {res.get('ram_before_kb', 0):,.1f} KB)")
     rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
     st.info(f"📁 Thư mục lưu: {rel}")
-    cols = st.columns(
+    cols = st.columns(len(res["files"]))
+    for c, path in zip(cols, res["files"]):
+        if os.path.exists(path):
+            with open(path, "rb") as fh: data = fh.read()
+            mime = XLSX_MIME if path.endswith(".xlsx") else "application/json"
+            c.download_button(f"⬇️ Tải {os.path.basename(path)}", data, file_name=os.path.basename(path), mime=mime, key=f"{prefix}_dl_{os.path.basename(path)}")
+    return res
 
 # ============================================================================
 # 🚚 TAB 1: FLEET (HẠM ĐỘI XE)
-# ============================================================================
-# ============================================================================
-# 🚚 TAB 1: FLEET (HẠM ĐỘI XE) — TOÀN BỘ HOÀN CHỈNH
 # ============================================================================
 VEHICLE_FIELDS = {
     "vehicle_id": ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"],
@@ -279,22 +282,19 @@ VEHICLE_FIELDS = {
     "fixed_cost": ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"],
     "variable_cost": ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"],
 }
-
 VEHICLE_NUMERIC = ["max_weight_kg", "max_volume_m3", "average_speed_kmh", "Max_Distance", "fixed_cost", "variable_cost"]
 
 def fleet_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
-    if values.empty:
-        return 0.0
+    if values.empty: return 0.0
     if field in VEHICLE_NUMERIC:
         return float(values.str.replace(r"[^\d.]", "", regex=True).str.len().gt(0).mean())
     return float(values.nunique() / len(values))
 
 def process_vehicle(rec):
     out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["vehicle_id", "license_plate", "id_warehouse"]}
-    for f in VEHICLE_NUMERIC:
-        out[f] = parse_num(rec.get(f))
+    for f in VEHICLE_NUMERIC: out[f] = parse_num(rec.get(f))
     out["trạng_thái"] = "✅ Hợp lệ"
     return out
 
@@ -322,40 +322,26 @@ def fleet_empty_table():
         "max_weight_kg": [5000, 2000],
         "max_volume_m3": [20, 10], 
         "average_speed_kmh": [50, 45],
-        "Max_Distance": [80, 100],  # Đã tích hợp đầy đủ cột Max_Distance
+        "Max_Distance": [80, 100],  # Bổ sung đầy đủ cột Max_Distance
         "fixed_cost": [500000, 300000], 
         "variable_cost": [5000, 4000],
     })
 
 def render_fleet_tab():
     st.header("🚚 Quản lý Hạm đội Xe (Fleet)")
-    st.markdown("**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**")
-    
     mode, edited, uploaded = render_input_block("fleet", "phương tiện", fleet_empty_table())
-    
     if st.button("🔍 Quét & Semantic Mapping", key="fleet_scan", type="primary"):
         run_scan("fleet", "phương tiện", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, VEHICLE_FIELDS, fleet_profile_score, 0.35))
-    
     raw = st.session_state.get("fleet_raw")
-    if raw is None: 
-        return
-        
-    st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_VEHICLE`)")
-    
+    if raw is None: return
     chosen = render_mapping("fleet", list(VEHICLE_FIELDS), raw)
-    
     if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
-        try:
-            colmap = build_colmap(raw, chosen)
-            rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw.iterrows()]
-            out = fleet_validate_output(pd.DataFrame(rows))
-            files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
-            ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
-            store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
-        except Exception as exc:
-            st.error(f"❌ Lỗi chi tiết: {exc}")
-            
+        colmap = build_colmap(raw, chosen)
+        rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw.iterrows()]
+        out = fleet_validate_output(pd.DataFrame(rows))
+        files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
+        ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
+        store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
     render_result("fleet", "📊 Kết quả Hạm đội")
 
 # ============================================================================
@@ -696,13 +682,6 @@ SCHEMA_CONTRACT = {
 }
 
 def evaluate_transportation_and_time_constraints(route_or_order, df_vehicles, vehicle_available_counts, outsourcing_config):
-    """
-    Ràng buộc vận tải thông minh:
-    1. Vượt toàn bộ hạm đội nhà -> Thuê ngoài Full (tính theo chuyến).
-    2. Lớn hơn xe lớn nhất hạm đội -> Cắt full-fill xe lớn nhất (trừ 1 xe trong ngày), phần dư xét thuê ngoài Tiết kiệm 1 hoặc Tiết kiệm 2.
-    3. Thỏa hạm đội -> Chọn xe NHỎ NHẤT khả thi (trừ 1 xe khả dụng trong ngày).
-    4. Kiểm tra Max_Distance -> Cắt đơn backlog sang thuê ngoài tiết kiệm loại 2.
-    """
     total_w = float(route_or_order.get("weight", route_or_order.get("total_weight_kg", 0.0)))
     total_v = float(route_or_order.get("volume", route_or_order.get("total_volume_m3", 0.0)))
     total_dist = float(route_or_order.get("km", route_or_order.get("total_distance_km", 0.0)))
