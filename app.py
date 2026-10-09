@@ -1,42 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-SMART LOGISTICS — STREAMLIT APP (chuyển đổi hoàn toàn từ Gradio / Colab)
+SMART LOGISTICS — STREAMLIT APP (Tab 1 → 5, bản thống nhất schema chuẩn)
 ================================================================================
-6 phân hệ (st.tabs):
-  1. Hạm đội xe (Fleet)                      -> output_fleet/
-  2. Kho & Tọa độ (Warehouse + ArcGIS)       -> output_warehouse/
-  3. Sản phẩm (Product)                      -> output_product/
-  4. Tài xế (Driver)                         -> output_driver/
-  5. Đơn hàng (Orders + Semantic Mapping)    -> output_orders/
-  6. Dashboard Định tuyến (Clarke-Wright)    -> output_customer/, output_matrix/
-     (đọc input từ chính các thư mục output_* ở trên)
+NGUYÊN TẮC MỚI: tên trường ánh xạ (mục/cột quét) == tên cột trong file DIM xuất ra.
+  Tab 1 Fleet     -> output_fleet/DIM_VEHICLE.xlsx
+  Tab 2 Warehouse -> output_warehouse/WAREHOUSE_WITH_COORDINATES.xlsx
+  Tab 3 Product   -> output_product/DIM_PRODUCT.xlsx
+  Tab 4 Driver    -> output_driver/DIM_DRIVER.xlsx
+  Tab 5 Orders    -> output_orders/DIM_ORDERS.xlsx
+Tab 6 (Clarke-Wright) sẽ đọc đúng các tên cột này.
 
-Mỗi tab dữ liệu có st.radio chọn: "Nhập trực tiếp (Data Editor)" hoặc
-"Upload file Excel/CSV/JSON". Không dùng Gradio / ipywidgets / display().
-
-requirements.txt đi kèm:
-    streamlit, pandas, numpy, openpyxl, xlrd, rapidfuzz, unidecode, geopy, requests
+requirements: streamlit, pandas, numpy, openpyxl, xlrd, rapidfuzz, unidecode, geopy
 ================================================================================
 """
 from __future__ import annotations
 
-import datetime as dt
 import io
 import json
-import math
 import os
 import re
 import time
 import warnings
 from collections import Counter
-from dataclasses import dataclass, field as dc_field
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-from geopy.extra.rate_limiter import RateLimiter
 from geopy.geocoders import ArcGIS
 from rapidfuzz import fuzz
 from rapidfuzz import process as rf_process
@@ -52,8 +42,7 @@ INPUT_MODES = ["Nhập trực tiếp (Data Editor)", "Upload file Excel/CSV/JSON
 UPLOAD_TYPES = ["xlsx", "xls", "xlsm", "csv", "json"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 VIETNAM_BOUNDS = (8.0, 24.0, 102.0, 110.0)
-MAP_THRESHOLD = 0.38  # ngưỡng semantic mapping của tab Đơn hàng
-DEFAULT_DEPOT = (21.0285, 105.8542)  # toạ độ kho mặc định (Hà Nội) như bản gốc
+MAP_THRESHOLD = 0.38
 
 BASE_DIR = os.getcwd()
 OUT_FLEET = os.path.join(BASE_DIR, "output_fleet")
@@ -61,12 +50,10 @@ OUT_WAREHOUSE = os.path.join(BASE_DIR, "output_warehouse")
 OUT_PRODUCT = os.path.join(BASE_DIR, "output_product")
 OUT_DRIVER = os.path.join(BASE_DIR, "output_driver")
 OUT_ORDERS = os.path.join(BASE_DIR, "output_orders")
-OUT_CUSTOMER = os.path.join(BASE_DIR, "output_customer")
-OUT_MATRIX = os.path.join(BASE_DIR, "output_matrix")
 
 
 class UserError(Exception):
-    """Lỗi nghiệp vụ hiển thị cho người dùng (thay cho gr.Error)."""
+    """Lỗi nghiệp vụ hiển thị cho người dùng."""
 
 
 # ============================================================================
@@ -83,8 +70,53 @@ def is_blank(v):
     return str(v).strip() == ""
 
 
+# ---------------------------------------------------------------------------
+# TỐI ƯU RAM: ép kiểu số về dạng nhỏ hơn (int64->int32, float64->float32, text lặp->category)
+# ---------------------------------------------------------------------------
+INT32_MIN, INT32_MAX = -2_147_483_648, 2_147_483_647
+FLOAT32_SAFE_MAX = 1e7                       # float32 giữ ~7 chữ số có nghĩa -> trên ngưỡng này giữ float64
+KEEP_FLOAT64 = {"lat", "lng", "lon", "latitude", "longitude"}   # toạ độ cần độ chính xác cao
+
+
+def optimize_dtypes(df, categorize=False, cat_ratio=0.5, keep_float64=KEEP_FLOAT64):
+    """Giảm RAM của DataFrame:
+      * int64  -> int32   (chỉ khi mọi giá trị nằm trong khoảng int32)
+      * float64-> float32 (chỉ khi |giá trị| < 1e7, và bỏ qua cột toạ độ lat/lng)
+      * object -> category (tuỳ chọn, chỉ khi số giá trị khác nhau < cat_ratio * số dòng)
+    Không đổi tên cột / giá trị nên không ảnh hưởng schema DIM."""
+    if df is None or len(df) == 0 or len(df.columns) == 0 or df.columns.duplicated().any():
+        return df
+    out = df.copy()
+    for col in out.columns:
+        s = out[col]
+        dtype = s.dtype
+        try:
+            is_text = (dtype == object) or (pd.api.types.is_string_dtype(dtype) and not isinstance(dtype, pd.CategoricalDtype))
+            if categorize and is_text and len(s) > 0:
+                if s.nunique(dropna=True) / len(s) < cat_ratio:
+                    out[col] = s.astype("category")
+                continue
+            if not isinstance(dtype, np.dtype):       # dtype mở rộng (Int64, category...) -> giữ nguyên
+                continue
+            if dtype.kind == "i" and dtype.itemsize > 4:
+                if s.min() >= INT32_MIN and s.max() <= INT32_MAX:
+                    out[col] = s.astype("int32")
+            elif dtype.kind == "f" and dtype.itemsize > 4:
+                if str(col).strip().lower() in keep_float64:
+                    continue
+                mx = s.abs().max()
+                if pd.isna(mx) or mx < FLOAT32_SAFE_MAX:
+                    out[col] = s.astype("float32")
+        except Exception:
+            continue                                  # cột lạ (list/dict...) -> giữ nguyên
+    return out
+
+
+def mem_kb(df) -> float:
+    return float(df.memory_usage(deep=True).sum()) / 1024.0
+
+
 def norm_basic(v):
-    """Chuẩn hóa tên cột cho 4 tab Fleet / Warehouse / Product / Driver."""
     return re.sub(r"[^a-z0-9 ]+", " ", unidecode(str(v)).lower()).strip()
 
 
@@ -93,7 +125,7 @@ def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     for enc in ("utf-8-sig", "cp1258", "latin-1"):
         try:
             df = pd.read_csv(io.BytesIO(data), encoding=enc)
-            if df.shape[1] == 1:  # CSV dùng dấu ; hoặc tab (Excel tiếng Việt)
+            if df.shape[1] == 1:
                 header = str(df.columns[0])
                 for sep in (";", "\t", "|"):
                     if sep in header:
@@ -104,10 +136,9 @@ def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     raise last_exc  # pragma: no cover
 
 
-def read_any(f) -> pd.DataFrame:
-    """Đọc file upload của Streamlit (UploadedFile): Excel / CSV / JSON."""
-    name = (getattr(f, "name", "") or "").lower()
-    data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _parse_upload(name: str, data: bytes) -> pd.DataFrame:
+    """Đọc + làm gọn DataFrame từ bytes. Cache theo (tên, nội dung) nên rerun không đọc lại file."""
     if name.endswith((".xlsx", ".xls", ".xlsm")):
         df = pd.read_excel(io.BytesIO(data))
     elif name.endswith(".json"):
@@ -121,11 +152,30 @@ def read_any(f) -> pd.DataFrame:
             df = pd.json_normalize(obj)
     else:
         df = _read_csv_bytes(data)
-    return df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    return optimize_dtypes(df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True))
+
+
+def read_any(f) -> pd.DataFrame:
+    """Đọc file upload của Streamlit (Excel / CSV / JSON) — có cache + ép kiểu nhỏ."""
+    name = (getattr(f, "name", "") or "").lower()
+    data = f.getvalue() if hasattr(f, "getvalue") else f.read()
+    return _parse_upload(name, data)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _read_excel_cached(path: str, mtime: float, index_col=None) -> pd.DataFrame:
+    # mtime nằm trong khoá cache: file DIM được ghi lại -> tự đọc bản mới
+    return optimize_dtypes(pd.read_excel(path, index_col=index_col))
+
+
+def read_dim_file(path: str, index_col=None) -> pd.DataFrame:
+    """Đọc file DIM_* từ thư mục output_* (dành cho Tab 6) — có cache + ép kiểu nhỏ."""
+    if not os.path.exists(path):
+        raise UserError(f"Chưa có file `{os.path.relpath(path, BASE_DIR)}`.")
+    return _read_excel_cached(path, os.path.getmtime(path), index_col)
 
 
 def get_input(mode, uploaded, edited, label):
-    """Lấy DataFrame thô từ Data Editor hoặc file upload."""
     if mode == INPUT_MODES[1]:
         if uploaded is None:
             raise UserError(f"Hãy upload file {label} trước.")
@@ -135,14 +185,16 @@ def get_input(mode, uploaded, edited, label):
     df = df.replace("", np.nan).dropna(how="all").reset_index(drop=True)
     if df.empty:
         raise UserError(f"Chưa có dữ liệu {label} để quét.")
-    return df
+    return optimize_dtypes(df)
 
 
 def basic_semantic_mapping(df, fields, profile_fn, threshold):
-    """Semantic Mapping cột (tên cột fuzzy + keyword + profile nội dung) — logic gốc
-    của Fleet / Warehouse / Product / Driver."""
+    """Semantic Mapping cột cho Fleet / Warehouse / Product / Driver.
+    fields: {tên_cột_DIM: [alias,...]}. Tên cột DIM luôn được thêm vào alias
+    -> file đã đúng chuẩn sẽ khớp 100%."""
     result, used = {}, set()
-    for fld, (_, aliases) in fields.items():
+    for fld, aliases in fields.items():
+        aliases = list(aliases) + [fld]
         best_col, best_score = None, 0.0
         for col in df.columns:
             if col in used:
@@ -162,12 +214,18 @@ def basic_semantic_mapping(df, fields, profile_fn, threshold):
 
 
 def df_to_records(df: pd.DataFrame):
-    clean = df.astype(object).where(df.notna(), None)
+    """DataFrame -> list dict thuần Python (JSON-safe). float32 được đổi qua chuỗi ngắn nhất
+    để 0.8 không thành 0.800000011920929."""
+    tmp = df.copy()
+    for c in tmp.columns[tmp.dtypes == "float32"]:
+        tmp[c] = pd.Series([float(str(x)) for x in tmp[c].to_numpy()], index=tmp.index, dtype="float64")
+    for c in tmp.columns[tmp.dtypes == "int32"]:
+        tmp[c] = tmp[c].astype("int64")
+    clean = tmp.astype(object).where(tmp.notna(), None)
     return clean.to_dict("records")
 
 
 def save_outputs(out_dir, base, sheet, df, extra_sheets=None):
-    """Tự động tạo thư mục đầu ra và ghi Excel + JSON."""
     os.makedirs(out_dir, exist_ok=True)
     xlsx = os.path.join(out_dir, f"{base}.xlsx")
     js = os.path.join(out_dir, f"{base}.json")
@@ -185,23 +243,33 @@ def conf_icon_ui(score):
     return "🟢" if score >= 0.75 else ("🟡" if score >= 0.55 else "🟠")
 
 
+def parse_num(val):
+    if is_blank(val):
+        return 0.0
+    try:
+        cleaned = re.sub(r"[^\d.-]", "", str(val))
+        return float(cleaned) if cleaned else 0.0
+    except Exception:
+        return 0.0
+
+
 # ============================================================================
-# 2. UI HELPER DÙNG CHUNG (Dual Input · Mapping · Result)
+# 2. UI HELPER DÙNG CHUNG
 # ============================================================================
 def render_input_block(prefix, label, seed_df):
-    """st.radio + st.data_editor / st.file_uploader. Trả về (mode, edited, uploaded)."""
     mode = st.radio(f"Cách nhập dữ liệu {label}", INPUT_MODES, horizontal=True, key=f"{prefix}_mode")
     edited, uploaded = None, None
     if mode == INPUT_MODES[0]:
         st.markdown(f"##### ✍️ Nhập trực tiếp danh mục {label}")
-        st.caption("Bấm vào ô để sửa, kéo xuống dòng cuối hoặc bấm ➕ để thêm dòng mới.")
+        st.caption("Tiêu đề cột bên dưới chính là **tên cột chuẩn** của file DIM xuất ra. "
+                   "Bấm vào ô để sửa, kéo xuống dòng cuối hoặc bấm ➕ để thêm dòng mới.")
         seed_key = f"{prefix}_seed"
         if seed_key not in st.session_state:
             st.session_state[seed_key] = seed_df.copy()
         edited = st.data_editor(st.session_state[seed_key], num_rows="dynamic", key=f"{prefix}_editor")
     else:
         st.markdown(f"##### 📂 Upload file {label}")
-        st.caption("Hỗ trợ **Excel (.xlsx/.xls/.xlsm) / CSV / JSON**.")
+        st.caption("Hỗ trợ **Excel (.xlsx/.xls/.xlsm) / CSV / JSON**. Tên cột trong file không cần đúng chuẩn, hệ thống sẽ tự ánh xạ.")
         uploaded = st.file_uploader(f"File {label}", type=UPLOAD_TYPES, key=f"{prefix}_upload")
         if uploaded is not None:
             try:
@@ -214,7 +282,6 @@ def render_input_block(prefix, label, seed_df):
 
 
 def run_scan(prefix, label, mode, uploaded, edited, mapping_fn):
-    """Xử lý nút 'Quét & Semantic Mapping': lưu raw + gợi ý mapping vào session_state."""
     try:
         raw = get_input(mode, uploaded, edited, label)
         mapping = mapping_fn(raw)
@@ -233,19 +300,19 @@ def run_scan(prefix, label, mode, uploaded, edited, mapping_fn):
     return True
 
 
-def render_mapping(prefix, specs, raw):
-    """Các st.selectbox để kiểm tra / sửa ánh xạ cột. Trả về {field: tên cột đã chọn}."""
+def render_mapping(prefix, fields, raw):
+    """fields: danh sách tên cột DIM (chuẩn). Nhãn selectbox = đúng tên cột DIM."""
     meta = st.session_state.get(f"{prefix}_meta", {})
     why = st.session_state.get(f"{prefix}_why", {})
     choices = [NONE] + [str(c) for c in raw.columns]
     chosen = {}
     cols = st.columns(2)
-    for i, (fld, label) in enumerate(specs):
+    for i, fld in enumerate(fields):
         key = f"{prefix}_col_{fld}"
         if st.session_state.get(key) not in choices:
             st.session_state[key] = NONE
         with cols[i % 2]:
-            chosen[fld] = st.selectbox(f"{label} ← cột nào?", choices, key=key)
+            chosen[fld] = st.selectbox(f"`{fld}` ← cột nào trong file?", choices, key=key)
             score = meta.get(fld, 0.0)
             note = why.get(fld, "")
             if score <= 0:
@@ -265,8 +332,10 @@ def pick(row, colmap, fld, default=""):
 
 
 def store_result(prefix, df, files, summary, metrics, extra=None):
+    # File Excel/JSON đã ghi từ DataFrame gốc (đủ độ chính xác); bản giữ trong RAM được làm gọn
     st.session_state[f"{prefix}_result"] = {
-        "df": df, "files": list(files), "summary": summary, "metrics": metrics, "extra": extra or {},
+        "df": optimize_dtypes(df, categorize=True), "files": list(files), "summary": summary,
+        "metrics": metrics, "extra": extra or {}, "ram_before_kb": mem_kb(df),
     }
 
 
@@ -281,6 +350,7 @@ def render_result(prefix, title):
         for c, (lab, val) in zip(cols, res["metrics"]):
             c.metric(lab, val)
     st.dataframe(res["df"])
+    st.caption(f"🧠 RAM bảng kết quả: {mem_kb(res['df']):,.1f} KB (gốc {res.get('ram_before_kb', 0):,.1f} KB)")
     rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
     st.info(f"📁 Đã tự động lưu vào thư mục nguồn: {rel}")
     cols = st.columns(len(res["files"]))
@@ -295,48 +365,40 @@ def render_result(prefix, title):
 
 
 # ============================================================================
-# TAB 1 — FLEET: logic gốc (Semantic Mapping · làm sạch · validate)
+# TAB 1 — FLEET  (trường ánh xạ == cột DIM_VEHICLE)
 # ============================================================================
-
 VEHICLE_FIELDS = {
-    "vehicle_id": ("Mã xe", ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"]),
-    "license_plate": ("Biển số", ["biển số", "bien so", "bsx", "license plate", "plate", "số xe", "so xe"]),
-    "warehouse_id": ("ID kho hoạt động", ["kho", "warehouse", "wh", "hub", "chi nhánh", "location", "ma kho", "id kho", "khu vực"]),
-    "max_weight": ("Trọng tải khối lượng (kg)", ["trọng tải", "trong tai", "weight", "payload", "khối lượng", "khoi luong", "kg", "tấn", "tan", "capacity kg"]),
-    "max_volume": ("Trọng tải thể tích (m3)", ["thể tích", "the tich", "volume", "m3", "cbm", "capacity m3"]),
-    "average_speed": ("Vận tốc trung bình (km/h)", ["vận tốc", "van toc", "speed", "vận tốc trung bình", "toc do trung binh", "avg speed", "kmh", "km/h"]),
-    "fixed_cost": ("Chi phí cố định", ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"]),
-    "variable_cost": ("Chi phí biến đổi", ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"])
+    "vehicle_id": ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id", "mã phương tiện"],
+    "license_plate": ["biển số", "bien so", "bsx", "license plate", "plate", "số xe", "so xe"],
+    "id_warehouse": ["kho", "warehouse", "wh", "hub", "chi nhánh", "location", "ma kho", "id kho", "khu vực", "warehouse id"],
+    "max_weight_kg": ["trọng tải", "trong tai", "weight", "payload", "khối lượng", "khoi luong", "kg", "tấn", "tan", "capacity kg", "max weight"],
+    "max_volume_m3": ["thể tích", "the tich", "volume", "m3", "cbm", "capacity m3", "max volume"],
+    "average_speed_kmh": ["vận tốc", "van toc", "speed", "vận tốc trung bình", "toc do trung binh", "avg speed", "kmh", "km/h", "average speed"],
+    "fixed_cost": ["chi phí cố định", "chi phi co dinh", "fixed cost", "cost fix", "fixed"],
+    "variable_cost": ["chi phí biến đổi", "chi phi bien doi", "variable cost", "variable", "cost km", "chi phí theo km"],
 }
+VEHICLE_NUMERIC = ["max_weight_kg", "max_volume_m3", "average_speed_kmh", "fixed_cost", "variable_cost"]
+
+
 def fleet_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
-    if values.empty: return 0.0
-    if field in ["max_weight", "max_volume", "average_speed", "fixed_cost", "variable_cost"]:
-        return float(values.str.replace(r"[^\d.]", "", regex=True).notna().mean())
+    if values.empty:
+        return 0.0
+    if field in VEHICLE_NUMERIC:
+        return float(values.str.replace(r"[^\d.]", "", regex=True).str.len().gt(0).mean())
     return float(values.nunique() / len(values))
-def parse_num(val):
-    if is_blank(val): return 0.0
-    try:
-        cleaned = re.sub(r"[^\d.-]", "", str(val))
-        return float(cleaned) if cleaned else 0.0
-    except: return 0.0
-def process_vehicle(v_id, plate, wh_id, weight, volume, speed, f_cost, v_cost):
-    raw_id = "" if is_blank(v_id) else str(v_id).strip()
-    raw_plate = "" if is_blank(plate) else str(plate).strip()
-    raw_wh = "" if is_blank(wh_id) else str(wh_id).strip()
-    result = {
-        "vehicle_id": raw_id,
-        "license_plate": raw_plate,
-        "id_warehouse": raw_wh,
-        "max_weight_kg": parse_num(weight),
-        "max_volume_m3": parse_num(volume),
-        "average_speed_kmh": parse_num(speed),
-        "fixed_cost": parse_num(f_cost),
-        "variable_cost": parse_num(v_cost),
-        "trạng_thái": "✅ Hợp lệ"
-    }
-    return result
+
+
+def process_vehicle(rec):
+    out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip())
+           for f in ["vehicle_id", "license_plate", "id_warehouse"]}
+    for f in VEHICLE_NUMERIC:
+        out[f] = parse_num(rec.get(f))
+    out["trạng_thái"] = "✅ Hợp lệ"
+    return out
+
+
 def fleet_validate_output(df):
     out = df.copy()
     dup_id = out["vehicle_id"].astype(str).duplicated(keep=False)
@@ -344,11 +406,11 @@ def fleet_validate_output(df):
     msgs = []
     for i, row in out.iterrows():
         errs = []
-        if is_blank(row.get("vehicle_id")): errs.append("Thiếu Mã xe")
-        if is_blank(row.get("license_plate")): errs.append("Thiếu Biển số")
-        if is_blank(row.get("id_warehouse")): errs.append("Thiếu ID kho hoạt động")
-        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")): errs.append("Trùng Mã xe")
-        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")): errs.append("Trùng Biển số")
+        if is_blank(row.get("vehicle_id")): errs.append("Thiếu vehicle_id")
+        if is_blank(row.get("license_plate")): errs.append("Thiếu license_plate")
+        if is_blank(row.get("id_warehouse")): errs.append("Thiếu id_warehouse")
+        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")): errs.append("Trùng vehicle_id")
+        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")): errs.append("Trùng license_plate")
         msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu phương tiện chuẩn")
     out["kiểm_tra"] = msgs
     return out
@@ -360,28 +422,19 @@ def fleet_semantic_mapping(df):
 
 def fleet_empty_table():
     return pd.DataFrame({
-        "Mã xe": ["VEH_01", "VEH_02"], "Biển số": ["29C-123.45", "29C-678.90"],
-        "ID kho": ["WH_HN_01", "WH_HN_01"], "Trọng tải (kg)": [5000, 2000],
-        "Thể tích (m3)": [20, 10], "Vận tốc (km/h)": [50, 45],
-        "Chi phí cố định": [500000, 300000], "Chi phí biến đổi": [5000, 4000],
+        "vehicle_id": ["VEH_01", "VEH_02"], "license_plate": ["29C-123.45", "29C-678.90"],
+        "id_warehouse": ["WH_HN_01", "WH_HN_01"], "max_weight_kg": [5000, 2000],
+        "max_volume_m3": [20, 10], "average_speed_kmh": [50, 45],
+        "fixed_cost": [500000, 300000], "variable_cost": [5000, 4000],
     })
 
 
 def fleet_process_all(raw_df, chosen):
     colmap = build_colmap(raw_df, chosen)
-    rows = []
-    for _, row in raw_df.iterrows():
-        rows.append(process_vehicle(
-            pick(row, colmap, "vehicle_id", ""), pick(row, colmap, "license_plate", ""),
-            pick(row, colmap, "warehouse_id", ""), pick(row, colmap, "max_weight", 0),
-            pick(row, colmap, "max_volume", 0), pick(row, colmap, "average_speed", 0),
-            pick(row, colmap, "fixed_cost", 0), pick(row, colmap, "variable_cost", 0)))
+    rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw_df.iterrows()]
     return fleet_validate_output(pd.DataFrame(rows))
 
 
-# ============================================================================
-# TAB 1 — UI
-# ============================================================================
 def render_fleet_tab():
     st.header("🚚 Smart Logistics — Quản lý & Chuẩn hóa Phương tiện")
     st.markdown("**Input → Semantic Mapping → Làm sạch thông số → Validate → Export Excel/JSON**")
@@ -395,9 +448,8 @@ def render_fleet_tab():
     if raw is None:
         return
     st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột phương tiện (cột nào không có chọn '-- Không sử dụng --')")
-    specs = [(f, v[0]) for f, v in VEHICLE_FIELDS.items()]
-    chosen = render_mapping("fleet", specs, raw)
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_VEHICLE`)")
+    chosen = render_mapping("fleet", list(VEHICLE_FIELDS), raw)
 
     if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
         try:
@@ -412,14 +464,20 @@ def render_fleet_tab():
 
 
 # ============================================================================
-# TAB 2 — WAREHOUSE: logic gốc (làm sạch địa chỉ · ArcGIS · validate)
+# TAB 2 — WAREHOUSE  (id_warehouse, address -> lat, lng ...)
 # ============================================================================
-
 def coordinate_in_vietnam(lat, lng):
-    try: lat, lng = float(lat), float(lng)
-    except: return False
+    try:
+        lat, lng = float(lat), float(lng)
+    except Exception:
+        return False
     return VIETNAM_BOUNDS[0] <= lat <= VIETNAM_BOUNDS[1] and VIETNAM_BOUNDS[2] <= lng <= VIETNAM_BOUNDS[3]
-ADDRESS_ABBR = [(r"\bTP\.?\b", "Thành phố"), (r"\bQ\.?\b", "Quận"), (r"\bH\.?\b", "Huyện"), (r"\bTX\.?\b", "Thị xã"), (r"\bTT\.?\b", "Thị trấn"), (r"\bP\.?\b", "Phường"), (r"\bX\.?\b", "Xã"), (r"\bĐg\.?\b", "Đường")]
+
+
+ADDRESS_ABBR = [(r"\bTP\.?\b", "Thành phố"), (r"\bQ\.?\b", "Quận"), (r"\bH\.?\b", "Huyện"), (r"\bTX\.?\b", "Thị xã"),
+                (r"\bTT\.?\b", "Thị trấn"), (r"\bP\.?\b", "Phường"), (r"\bX\.?\b", "Xã"), (r"\bĐg\.?\b", "Đường")]
+
+
 def clean_address(address):
     if is_blank(address): return ""
     text = str(address).replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -435,6 +493,8 @@ def clean_address(address):
     text = re.sub(r"\s+", " ", text).strip(" ,.")
     if text and not re.search(r"\bViệt Nam\b|\bVietnam\b", text, re.I): text += ", Việt Nam"
     return text
+
+
 def address_quality(address):
     if not address: return 0.0, "❌ Địa chỉ trống"
     score, notes = 0.0, []
@@ -447,44 +507,21 @@ def address_quality(address):
     else: notes.append("thiếu thành phần hành chính")
     if re.search(r"\bViệt Nam\b", address, re.I): score += 0.10
     return min(score, 1.0), ("✅ Địa chỉ sạch" if not notes else "⚠️ " + "; ".join(notes))
-WAREHOUSE_FIELDS = {"warehouse_id": ("Mã kho", ["mã kho", "warehouse id", "warehouse code", "warehouse", "kho", "id kho", "invent id", "invent_id"]), "address": ("Địa chỉ kho", ["địa chỉ", "địa điểm", "address", "location", "vị trí"])}
+
+
+WAREHOUSE_FIELDS = {
+    "id_warehouse": ["mã kho", "warehouse id", "warehouse code", "warehouse", "kho", "id kho", "invent id", "invent_id"],
+    "address": ["địa chỉ", "địa điểm", "address", "location", "vị trí"],
+}
+
+
 def wh_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
     if values.empty: return 0.0
-    if field == "address": return float(0.7 * (values.str.len() >= 10).mean() + 0.3 * values.str.contains(r"[,\-/]").mean())
+    if field == "address":
+        return float(0.7 * (values.str.len() >= 10).mean() + 0.3 * values.str.contains(r"[,\-/]").mean())
     return float(values.nunique() / len(values))
-def process_warehouse(warehouse_id, address, do_geocode=True):
-    raw_address = "" if is_blank(address) else str(address).strip()
-    cleaned = clean_address(raw_address)
-    quality, clean_status = address_quality(cleaned)
-    result = {"id_warehouse": "" if is_blank(warehouse_id) else str(warehouse_id).strip(), "address": cleaned, "lat": None, "lng": None, "địa_chỉ_gốc": raw_address, "chất_lượng_địa_chỉ": quality, "trạng_thái_làm_sạch": clean_status, "địa_chỉ_geocode": "", "geocode_score": None, "trạng_thái_geocode": "—", "nguồn_tọa_độ": ""}
-    if is_blank(warehouse_id): result["trạng_thái_geocode"] = "❌ Thiếu Mã kho"; return result
-    if not cleaned: result["trạng_thái_geocode"] = "❌ Không có địa chỉ để geocode"; return result
-    if not do_geocode: result["trạng_thái_geocode"] = "⏸️ Đã tắt geocoding"; return result
-    geo = geocode_address(cleaned)
-    if not geo["ok"]: result["trạng_thái_geocode"] = geo["status"]; return result
-    result.update({"lat": geo["lat"], "lng": geo["lng"], "địa_chỉ_geocode": geo["display_name"], "geocode_score": geo["score"], "trạng_thái_geocode": f"✅ ArcGIS geocode thành công" + (f" | score {geo['score']:.0f}" if geo["score"] is not None else ""), "nguồn_tọa_độ": "ArcGIS"})
-    return result
-def warehouse_validate_output(df):
-    out = df.copy()
-    dup = out["id_warehouse"].astype(str).duplicated(keep=False)
-    msgs = []
-    for i, row in out.iterrows():
-        errs = []
-        if is_blank(row.get("id_warehouse")): errs.append("Thiếu Mã kho")
-        if is_blank(row.get("address")): errs.append("Thiếu địa chỉ")
-        lat, lng = row.get("lat"), row.get("lng")
-        if pd.isna(lat) or pd.isna(lng): errs.append("Chưa có Lat/Lon")
-        elif not coordinate_in_vietnam(lat, lng): errs.append("Lat/Lon ngoài Việt Nam")
-        if dup.iloc[i] and not is_blank(row.get("id_warehouse")): errs.append("Trùng Mã kho")
-        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu + Lat/Lon hợp lệ")
-    out["kiểm_tra"] = msgs
-    return out
-
-
-def wh_semantic_mapping(df):
-    return basic_semantic_mapping(df, WAREHOUSE_FIELDS, wh_profile_score, 0.40)
 
 
 @st.cache_resource(show_spinner=False)
@@ -501,7 +538,6 @@ def _geo_cache():
 
 
 def geocode_address(address, retries=3):
-    """Geocode 1 địa chỉ bằng ArcGIS (có cache; không cache lỗi mạng)."""
     if not address:
         return {"ok": False, "status": "❌ Địa chỉ trống"}
     cache = _geo_cache()
@@ -520,10 +556,8 @@ def geocode_address(address, retries=3):
                 return res
             raw = getattr(loc, "raw", {}) or {}
             score = raw.get("score")
-            try:
-                score = float(score) if score is not None else None
-            except Exception:
-                score = None
+            try: score = float(score) if score is not None else None
+            except Exception: score = None
             lat, lng = float(loc.latitude), float(loc.longitude)
             if not coordinate_in_vietnam(lat, lng):
                 res = {"ok": False, "status": "⚠️ ArcGIS trả tọa độ ngoài Việt Nam"}
@@ -539,20 +573,55 @@ def geocode_address(address, retries=3):
     return {"ok": False, "status": f"❌ ArcGIS lỗi sau {retries} lần: {last_error[:150]}"}
 
 
+def process_warehouse(warehouse_id, address, do_geocode=True):
+    raw_address = "" if is_blank(address) else str(address).strip()
+    cleaned = clean_address(raw_address)
+    quality, clean_status = address_quality(cleaned)
+    result = {"id_warehouse": "" if is_blank(warehouse_id) else str(warehouse_id).strip(), "address": cleaned,
+              "lat": None, "lng": None, "địa_chỉ_gốc": raw_address, "chất_lượng_địa_chỉ": quality,
+              "trạng_thái_làm_sạch": clean_status, "địa_chỉ_geocode": "", "geocode_score": None,
+              "trạng_thái_geocode": "—", "nguồn_tọa_độ": ""}
+    if is_blank(warehouse_id): result["trạng_thái_geocode"] = "❌ Thiếu id_warehouse"; return result
+    if not cleaned: result["trạng_thái_geocode"] = "❌ Không có địa chỉ để geocode"; return result
+    if not do_geocode: result["trạng_thái_geocode"] = "⏸️ Đã tắt geocoding"; return result
+    geo = geocode_address(cleaned)
+    if not geo["ok"]: result["trạng_thái_geocode"] = geo["status"]; return result
+    result.update({"lat": geo["lat"], "lng": geo["lng"], "địa_chỉ_geocode": geo["display_name"],
+                   "geocode_score": geo["score"],
+                   "trạng_thái_geocode": "✅ ArcGIS geocode thành công" + (f" | score {geo['score']:.0f}" if geo["score"] is not None else ""),
+                   "nguồn_tọa_độ": "ArcGIS"})
+    return result
+
+
+def warehouse_validate_output(df):
+    out = df.copy()
+    dup = out["id_warehouse"].astype(str).duplicated(keep=False)
+    msgs = []
+    for i, row in out.iterrows():
+        errs = []
+        if is_blank(row.get("id_warehouse")): errs.append("Thiếu id_warehouse")
+        if is_blank(row.get("address")): errs.append("Thiếu address")
+        lat, lng = row.get("lat"), row.get("lng")
+        if pd.isna(lat) or pd.isna(lng): errs.append("Chưa có lat/lng")
+        elif not coordinate_in_vietnam(lat, lng): errs.append("lat/lng ngoài Việt Nam")
+        if dup.iloc[i] and not is_blank(row.get("id_warehouse")): errs.append("Trùng id_warehouse")
+        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu + lat/lng hợp lệ")
+    out["kiểm_tra"] = msgs
+    return out
+
+
+def wh_semantic_mapping(df):
+    return basic_semantic_mapping(df, WAREHOUSE_FIELDS, wh_profile_score, 0.40)
+
+
 def warehouse_empty_table():
-    return pd.DataFrame({
-        "Mã kho": ["WH_HN_01"],
-        "Địa chỉ kho": ["Số 1 Tràng Tiền, Hoàn Kiếm, Hà Nội"],
-    })
+    return pd.DataFrame({"id_warehouse": ["WH_HN_01"], "address": ["Số 1 Tràng Tiền, Hoàn Kiếm, Hà Nội"]})
 
 
-# ============================================================================
-# TAB 2 — UI
-# ============================================================================
 def render_warehouse_tab():
     st.header("🏭 Smart Logistics — Quét tọa độ kho (ArcGIS Geocoding)")
-    st.markdown("**Input → Semantic Mapping → Làm sạch địa chỉ → ArcGIS Geocoding → Lat/Lon → Export**")
-    st.info("🔒 Người dùng chỉ nhập **Mã kho + Địa chỉ kho**. Lat/Lon do hệ thống tự động lấy từ ArcGIS.")
+    st.markdown("**Input → Semantic Mapping → Làm sạch địa chỉ → ArcGIS Geocoding → lat/lng → Export**")
+    st.info("🔒 Người dùng chỉ nhập **id_warehouse + address**. lat/lng do hệ thống tự động lấy từ ArcGIS.")
     do_geo = st.checkbox("🌍 Bật ArcGIS Geocoding", value=True, key="wh_do_geo")
     mode, edited, uploaded = render_input_block("wh", "kho", warehouse_empty_table())
 
@@ -563,21 +632,20 @@ def render_warehouse_tab():
     if raw is None:
         return
     st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra mapping")
-    specs = [(f, v[0]) for f, v in WAREHOUSE_FIELDS.items()]
-    chosen = render_mapping("wh", specs, raw)
+    st.markdown("### 🔗 Kiểm tra mapping (tên trường = tên cột trong file kho xuất ra)")
+    chosen = render_mapping("wh", list(WAREHOUSE_FIELDS), raw)
 
     if st.button("🚀 Làm sạch + Geocoding", key="wh_process", type="primary"):
         try:
             colmap = build_colmap(raw, chosen)
-            if "warehouse_id" not in colmap:
-                raise UserError("Chưa chọn cột Mã kho.")
+            if "id_warehouse" not in colmap:
+                raise UserError("Chưa chọn cột id_warehouse.")
             if "address" not in colmap:
-                raise UserError("Chưa chọn cột Địa chỉ kho.")
+                raise UserError("Chưa chọn cột address.")
             rows, n = [], len(raw)
             prog = st.progress(0.0, text="Đang làm sạch + geocode kho...")
             for k, (_, row) in enumerate(raw.iterrows(), 1):
-                rows.append(process_warehouse(row.get(colmap["warehouse_id"]), row.get(colmap["address"]), do_geocode=do_geo))
+                rows.append(process_warehouse(row.get(colmap["id_warehouse"]), row.get(colmap["address"]), do_geocode=do_geo))
                 prog.progress(k / n, text=f"Đã xử lý {k}/{n} kho")
             prog.empty()
             out = warehouse_validate_output(pd.DataFrame(rows))
@@ -586,7 +654,7 @@ def render_warehouse_tab():
             geocoded = int(out["lat"].notna().sum())
             store_result("wh", out, files, "🧭 Hoàn tất quét kho",
                          [("Tổng số kho", len(out)), ("Geocode thành công", f"{geocoded}/{len(out)}"),
-                          ("Đủ Lat/Lon + hợp lệ", f"{ok}/{len(out)}")])
+                          ("Đủ lat/lng + hợp lệ", f"{ok}/{len(out)}")])
         except UserError as exc:
             st.error(f"❌ {exc}")
         except Exception as exc:
@@ -600,51 +668,48 @@ def render_warehouse_tab():
 
 
 # ============================================================================
-# TAB 3 — PRODUCT: logic gốc
+# TAB 3 — PRODUCT  (trường == cột DIM_PRODUCT)
 # ============================================================================
-
 PRODUCT_FIELDS = {
-    "product_id": ("Mã sản phẩm", ["mã sản phẩm", "product id", "sku", "item code", "mã sp", "code", "id"]),
-    "product_name": ("Tên sản phẩm", ["tên sản phẩm", "product name", "item name", "tên sp", "name", "mô tả"]),
-    "volume": ("Thể tích", ["thể tích", "the tich", "volume", "m3", "cbm", "capacity"]),
-    "weight": ("Trọng lượng / Khối lượng", ["trọng lượng", "trong luong", "khối lượng", "khoi luong", "weight", "kg", "tấn", "mass"]),
-    "length": ("Chiều dài", ["dài", "dai", "length", "l", "dim l"]),
-    "width": ("Chiều rộng", ["rộng", "rong", "width", "w", "dim w"]),
-    "height": ("Chiều cao", ["cao", "height", "h", "dim h"]),
-    "cost_price": ("Giá sản xuất", ["giá sản xuất", "gia san xuat", "cost price", "cost", "giá vốn", "giá gốc"]),
-    "selling_price": ("Giá bán", ["giá bán", "gia ban", "selling price", "price", "retail price", "unit price"])
+    "product_id": ["mã sản phẩm", "product id", "sku", "item code", "mã sp", "code", "id"],
+    "product_name": ["tên sản phẩm", "product name", "item name", "tên sp", "name", "mô tả"],
+    "volume": ["thể tích", "the tich", "volume", "m3", "cbm", "capacity"],
+    "weight": ["trọng lượng", "trong luong", "khối lượng", "khoi luong", "weight", "kg", "tấn", "mass"],
+    "length": ["dài", "dai", "length", "l", "dim l"],
+    "width": ["rộng", "rong", "width", "w", "dim w"],
+    "height": ["cao", "height", "h", "dim h"],
+    "cost_price": ["giá sản xuất", "gia san xuat", "cost price", "cost", "giá vốn", "giá gốc"],
+    "selling_price": ["giá bán", "gia ban", "selling price", "price", "retail price", "unit price"],
 }
+PRODUCT_NUMERIC = ["volume", "weight", "length", "width", "height", "cost_price", "selling_price"]
+
+
 def product_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
     if values.empty: return 0.0
-    if field in ["volume", "weight", "length", "width", "height", "cost_price", "selling_price"]:
-        return float(values.str.replace(r"[^\d.]", "", regex=True).notna().mean())
+    if field in PRODUCT_NUMERIC:
+        return float(values.str.replace(r"[^\d.]", "", regex=True).str.len().gt(0).mean())
     return float(values.nunique() / len(values))
-def process_product(p_id, p_name, vol, wgt, l, w, h, cost, price):
-    raw_id = "" if is_blank(p_id) else str(p_id).strip()
-    raw_name = "" if is_blank(p_name) else str(p_name).strip()
-    return {
-        "product_id": raw_id,
-        "product_name": raw_name,
-        "volume": parse_num(vol),
-        "weight": parse_num(wgt),
-        "length": parse_num(l),
-        "width": parse_num(w),
-        "height": parse_num(h),
-        "cost_price": parse_num(cost),
-        "selling_price": parse_num(price),
-        "trạng_thái": "✅ Hợp lệ"
-    }
+
+
+def process_product(rec):
+    out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["product_id", "product_name"]}
+    for f in PRODUCT_NUMERIC:
+        out[f] = parse_num(rec.get(f))
+    out["trạng_thái"] = "✅ Hợp lệ"
+    return out
+
+
 def product_validate_output(df):
     out = df.copy()
     dup_id = out["product_id"].astype(str).duplicated(keep=False)
     msgs = []
     for i, row in out.iterrows():
         errs = []
-        if is_blank(row.get("product_id")): errs.append("Thiếu Mã sản phẩm")
-        if is_blank(row.get("product_name")): errs.append("Thiếu Tên sản phẩm")
-        if dup_id.iloc[i] and not is_blank(row.get("product_id")): errs.append("Trùng Mã sản phẩm")
+        if is_blank(row.get("product_id")): errs.append("Thiếu product_id")
+        if is_blank(row.get("product_name")): errs.append("Thiếu product_name")
+        if dup_id.iloc[i] and not is_blank(row.get("product_id")): errs.append("Trùng product_id")
         msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu sản phẩm chuẩn")
     out["kiểm_tra"] = msgs
     return out
@@ -656,29 +721,18 @@ def product_semantic_mapping(df):
 
 def product_empty_table():
     return pd.DataFrame({
-        "Mã sản phẩm": ["SP_01"], "Tên sản phẩm": ["Ghế Sofa Gỗ Sồi"],
-        "Thể tích (m3)": [0.5], "Trọng lượng (kg)": [25.0],
-        "Dài (cm)": [120], "Rộng (cm)": [60], "Cao (cm)": [80],
-        "Giá sản xuất": [1200000], "Giá bán": [2500000],
+        "product_id": ["SP_01"], "product_name": ["Ghế Sofa Gỗ Sồi"],
+        "volume": [0.5], "weight": [25.0], "length": [120], "width": [60], "height": [80],
+        "cost_price": [1200000], "selling_price": [2500000],
     })
 
 
 def product_process_all(raw_df, chosen):
     colmap = build_colmap(raw_df, chosen)
-    rows = []
-    for _, row in raw_df.iterrows():
-        rows.append(process_product(
-            pick(row, colmap, "product_id", ""), pick(row, colmap, "product_name", ""),
-            pick(row, colmap, "volume", 0), pick(row, colmap, "weight", 0),
-            pick(row, colmap, "length", 0), pick(row, colmap, "width", 0),
-            pick(row, colmap, "height", 0), pick(row, colmap, "cost_price", 0),
-            pick(row, colmap, "selling_price", 0)))
+    rows = [process_product({f: pick(r, colmap, f, None) for f in PRODUCT_FIELDS}) for _, r in raw_df.iterrows()]
     return product_validate_output(pd.DataFrame(rows))
 
 
-# ============================================================================
-# TAB 3 — UI
-# ============================================================================
 def render_product_tab():
     st.header("📦 Smart Logistics — Quản lý & Chuẩn hóa Sản phẩm")
     st.markdown("**Input → Semantic Mapping → Làm sạch thông số kích thước/giá → Validate → Export Excel/JSON**")
@@ -692,9 +746,8 @@ def render_product_tab():
     if raw is None:
         return
     st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột sản phẩm (cột nào không có chọn '-- Không sử dụng --')")
-    specs = [(f, v[0]) for f, v in PRODUCT_FIELDS.items()]
-    chosen = render_mapping("product", specs, raw)
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_PRODUCT`)")
+    chosen = render_mapping("product", list(PRODUCT_FIELDS), raw)
 
     if st.button("🚀 Chuẩn hóa & Xử lý Product", key="product_process", type="primary"):
         try:
@@ -709,45 +762,44 @@ def render_product_tab():
 
 
 # ============================================================================
-# TAB 4 — DRIVER: logic gốc
+# TAB 4 — DRIVER  (trường == cột DIM_DRIVER; kho = id_warehouse)
 # ============================================================================
-
 DRIVER_FIELDS = {
-    "driver_id": ("Mã tài xế", ["mã tài xế", "driver id", "driver code", "mã nv", "staff id", "id", "code"]),
-    "driver_name": ("Họ và tên", ["họ và tên", "ho va ten", "tên tài xế", "ten tai xe", "full name", "name", "họ tên", "tên nhân viên"]),
-    "license_type": ("Loại bằng", ["loại bằng", "loai bang", "bằng lái", "bang lai", "license", "class", "hạng bằng"]),
-    "warehouse": ("Kho hoạt động", ["kho", "warehouse", "trạm", "hub", "địa điểm kho", "chi nhánh"]),
-    "address": ("Địa chỉ", ["địa chỉ", "dia chi", "address", "nơi ở"]),
-    "phone": ("Số điện thoại", ["số điện thoại", "so dien thoai", "phone", "sdt", "mobile", "hotline"]),
-    "role": ("Vị trí làm việc", ["vị trí", "vi tri", "role", "chức vụ", "job", "loại nhân sự", "vị trí làm việc"])
+    "driver_id": ["mã tài xế", "driver id", "driver code", "mã nv", "staff id", "id", "code"],
+    "driver_name": ["họ và tên", "ho va ten", "tên tài xế", "ten tai xe", "full name", "name", "họ tên", "tên nhân viên"],
+    "license_type": ["loại bằng", "loai bang", "bằng lái", "bang lai", "license", "class", "hạng bằng"],
+    "id_warehouse": ["kho", "warehouse", "trạm", "hub", "địa điểm kho", "chi nhánh", "warehouse id", "id kho", "mã kho"],
+    "address": ["địa chỉ", "dia chi", "address", "nơi ở"],
+    "phone": ["số điện thoại", "so dien thoai", "phone", "sdt", "mobile", "hotline"],
+    "role": ["vị trí", "vi tri", "role", "chức vụ", "job", "loại nhân sự", "vị trí làm việc"],
 }
+
+
 def driver_profile_score(series, field):
     values = series.dropna().astype(str).str.strip()
     values = values[values != ""]
     if values.empty: return 0.0
     if field == "phone":
-        return float(values.str.replace(r"[^\d+]", "", regex=True).notna().mean())
+        return float(values.str.replace(r"[^\d+]", "", regex=True).str.len().gt(0).mean())
     return float(values.nunique() / len(values))
-def process_driver(d_id, d_name, lic, wh, addr, phone, role):
-    return {
-        "driver_id": "" if is_blank(d_id) else str(d_id).strip(),
-        "driver_name": "" if is_blank(d_name) else str(d_name).strip(),
-        "license_type": "" if is_blank(lic) else str(lic).strip().upper(),
-        "id_warehouse": "" if is_blank(wh) else str(wh).strip(),
-        "address": "" if is_blank(addr) else str(addr).strip(),
-        "phone": "" if is_blank(phone) else str(phone).strip(),
-        "role": "" if is_blank(role) else str(role).strip(),
-        "trạng_thái": "✅ Hợp lệ"
-    }
+
+
+def process_driver(rec):
+    out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in DRIVER_FIELDS}
+    out["license_type"] = out["license_type"].upper()
+    out["trạng_thái"] = "✅ Hợp lệ"
+    return out
+
+
 def driver_validate_output(df):
     out = df.copy()
     dup_id = out["driver_id"].astype(str).duplicated(keep=False)
     msgs = []
     for i, row in out.iterrows():
         errs = []
-        if is_blank(row.get("driver_id")): errs.append("Thiếu Mã tài xế")
-        if is_blank(row.get("driver_name")): errs.append("Thiếu Họ và tên")
-        if dup_id.iloc[i] and not is_blank(row.get("driver_id")): errs.append("Trùng Mã tài xế")
+        if is_blank(row.get("driver_id")): errs.append("Thiếu driver_id")
+        if is_blank(row.get("driver_name")): errs.append("Thiếu driver_name")
+        if dup_id.iloc[i] and not is_blank(row.get("driver_id")): errs.append("Trùng driver_id")
         msgs.append("❌ " + "; ".join(errs) if errs else "✅ Đủ dữ liệu tài xế chuẩn")
     out["kiểm_tra"] = msgs
     return out
@@ -759,31 +811,19 @@ def driver_semantic_mapping(df):
 
 def driver_empty_table():
     return pd.DataFrame({
-        "Mã tài xế": ["DRV_01", "DRV_02"],
-        "Họ và tên": ["Nguyễn Văn A", "Trần Văn B"],
-        "Loại bằng": ["FC", "C"],
-        "Kho hoạt động": ["WH_HN_01", "WH_HN_01"],
-        "Địa chỉ": ["Hà Nội", "Hà Nội"],
-        "Số điện thoại": ["0901234567", "0987654321"],
-        "Vị trí làm việc": ["Tài xế chính", "Hỗ trợ vận chuyển đồ"],
+        "driver_id": ["DRV_01", "DRV_02"], "driver_name": ["Nguyễn Văn A", "Trần Văn B"],
+        "license_type": ["FC", "C"], "id_warehouse": ["WH_HN_01", "WH_HN_01"],
+        "address": ["Hà Nội", "Hà Nội"], "phone": ["0901234567", "0987654321"],
+        "role": ["Tài xế chính", "Hỗ trợ vận chuyển đồ"],
     })
 
 
 def driver_process_all(raw_df, chosen):
     colmap = build_colmap(raw_df, chosen)
-    rows = []
-    for _, row in raw_df.iterrows():
-        rows.append(process_driver(
-            pick(row, colmap, "driver_id", ""), pick(row, colmap, "driver_name", ""),
-            pick(row, colmap, "license_type", ""), pick(row, colmap, "warehouse", ""),
-            pick(row, colmap, "address", ""), pick(row, colmap, "phone", ""),
-            pick(row, colmap, "role", "")))
+    rows = [process_driver({f: pick(r, colmap, f, None) for f in DRIVER_FIELDS}) for _, r in raw_df.iterrows()]
     return driver_validate_output(pd.DataFrame(rows))
 
 
-# ============================================================================
-# TAB 4 — UI
-# ============================================================================
 def render_driver_tab():
     st.header("👨‍✈️ Smart Logistics — Quản lý & Chuẩn hóa Tài xế")
     st.markdown("**Input → Semantic Mapping → Làm sạch thông tin nhân sự → Validate → Export Excel/JSON**")
@@ -797,9 +837,8 @@ def render_driver_tab():
     if raw is None:
         return
     st.success(f"🔍 Đã quét **{len(raw)} dòng × {len(raw.columns)} cột**")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột tài xế (cột nào không có chọn '-- Không sử dụng --')")
-    specs = [(f, v[0]) for f, v in DRIVER_FIELDS.items()]
-    chosen = render_mapping("driver", specs, raw)
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_DRIVER`)")
+    chosen = render_mapping("driver", list(DRIVER_FIELDS), raw)
 
     if st.button("🚀 Chuẩn hóa & Xử lý Driver", key="driver_process", type="primary"):
         try:
@@ -814,87 +853,92 @@ def render_driver_tab():
 
 
 # ============================================================================
-# TAB 5 — ORDERS: logic gốc (Semantic Mapping cột + giá trị · B2B/B2C · Alert · đơn vị)
+# TAB 5 — ORDERS  (trường == cột DIM_ORDERS)
 # ============================================================================
-
 def to_text(v):
-    """Giá trị bất kỳ -> chuỗi sạch (1.0 -> '1', True -> 'true')."""
     if is_blank(v): return ""
     if isinstance(v, (bool, np.bool_)): return "true" if v else "false"
     if isinstance(v, (float, np.floating)) and float(v).is_integer(): return str(int(v))
     return str(v).strip()
+
+
 def split_camel(s):
     return re.sub(r"([a-z])([A-Z])", r"\1 \2", str(s))
+
+
 def norm(v):
-    """Bỏ dấu, thường hóa, tách camelCase/underscore: 'Mã_Đơn' / 'orderID' -> 'ma don' / 'order id'."""
     s = unidecode(split_camel(to_text(v) if not isinstance(v, str) else v)).lower()
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s)).strip()
-ORDER_FIELDS = {
-    "order_id": dict(label="Mã đơn", aliases=[
+
+
+# Khóa của ORDER_FIELDS == tên cột trong DIM_ORDERS. "label" = đúng tên cột đó.
+_ORDER_RAW = {
+    "order_id": dict(aliases=[
         "mã đơn", "mã đơn hàng", "số đơn", "số đơn hàng", "mã đh", "id đơn", "đơn hàng", "order id", "order no",
         "order number", "order code", "order ref", "order", "oid", "ord id", "ord no", "so number", "sales order",
         "transaction id", "invoice no", "mã giao dịch", "số chứng từ"],
         negative=["customer", "khach", "cus", "client", "product", "sku", "item", "hang", "sp", "status", "type",
                   "date", "ngay", "tinh trang", "loai", "trang thai", "qty", "weight", "volume", "priority"]),
-    "customer_id": dict(label="Mã khách", aliases=[
+    "customer_id": dict(aliases=[
         "mã khách", "mã khách hàng", "mã kh", "kh id", "customer id", "customer code", "customer no", "cust id",
         "cust code", "cus id", "cus code", "client id", "client code", "account id", "account number", "buyer id",
         "mã người mua", "mã đối tác", "mã đại lý", "mã nhà phân phối", "cid"],
         negative=["name", "ten", "order", "don", "address", "dia chi", "type", "loai"]),
-    "customer_name": dict(label="Tên khách", aliases=[
+    "customer_name": dict(aliases=[
         "tên khách", "tên khách hàng", "tên kh", "khách hàng", "khách", "người nhận", "tên người nhận", "người mua",
         "họ tên", "họ và tên", "tên công ty", "tên đơn vị", "customer name", "client name", "buyer name", "recipient",
         "receiver", "consignee", "ship to name", "account name", "company name", "contact name", "name", "customer"],
         negative=["id", "ma", "code", "no", "type", "loai", "address", "dia chi", "item", "product", "san pham",
                   "hang", "sku", "file"]),
-    "quantity": dict(label="Số lượng mua", aliases=[
+    "quantity": dict(aliases=[
         "số lượng", "số lượng mua", "sl", "sl mua", "tổng số lượng", "số kiện", "số cái", "qty", "quantity",
         "order qty", "total qty", "units", "pcs", "pieces", "count"],
         negative=["weight", "volume", "price", "don gia", "thanh tien", "cost", "trong luong", "the tich"]),
-    "items": dict(label="Mặt hàng mua", aliases=[
+    "items": dict(aliases=[
         "mặt hàng", "mặt hàng mua", "hàng hóa", "tên hàng", "tên hàng hóa", "sản phẩm", "tên sản phẩm", "danh sách hàng",
         "nội dung hàng", "mô tả hàng", "loại hàng", "items", "item", "item name", "product", "products", "product name",
         "sku", "goods", "cargo", "description"],
         negative=["qty", "quantity", "weight", "volume", "so luong"]),
-    "total_weight": dict(label="Tổng trọng lượng (kg)", aliases=[
+    "total_weight_kg": dict(aliases=[
         "tổng trọng lượng", "trọng lượng", "khối lượng", "tổng khối lượng", "khối lượng hàng", "cân nặng", "tải trọng",
         "weight", "total weight", "gross weight", "net weight", "weight kg", "wt", "kg"],
         negative=["volume", "the tich", "m3", "cbm"]),
-    "total_volume": dict(label="Tổng thể tích (m3)", aliases=[
+    "total_volume_m3": dict(aliases=[
         "tổng thể tích", "thể tích", "số khối", "khối hàng", "dung tích", "kích thước", "kích thước kiện",
         "volume", "total volume", "vol", "m3", "cbm", "cubic", "dimension", "dimensions", "size"],
         negative=["weight", "trong luong", "khoi luong", "kg", "luong"]),
-    "address": dict(label="Địa chỉ khách", aliases=[
+    "address": dict(aliases=[
         "địa chỉ", "địa chỉ khách", "địa chỉ khách hàng", "địa chỉ giao hàng", "địa chỉ nhận", "nơi giao", "nơi giao hàng",
         "nơi nhận", "nơi nhận hàng", "điểm giao", "điểm giao hàng", "địa điểm giao", "đích đến", "vị trí",
         "address", "delivery address", "shipping address", "destination address", "ship to", "deliver to",
         "location", "destination", "addr", "street"],
         negative=["email", "mail", "ip", "web", "phone", "dien thoai"]),
-    "order_status": dict(label="Tình trạng đơn", aliases=[
+    "order_status": dict(aliases=[
         "tình trạng đơn", "trạng thái đơn", "trạng thái", "tình trạng", "trạng thái giao hàng", "trạng thái xử lý",
         "tiến độ", "order status", "status", "state", "delivery status", "fulfillment status", "stage"],
         negative=["alert", "canh bao", "priority", "payment", "thanh toan"]),
-    "order_type": dict(label="Loại đơn (B2C/B2B)", aliases=[
+    "order_type": dict(aliases=[
         "loại đơn", "loại đơn hàng", "loại khách", "loại khách hàng", "phân loại khách", "nhóm khách hàng", "đối tượng",
         "kênh", "kênh bán", "kênh bán hàng", "loại hình", "order type", "customer type", "customer segment", "segment",
         "client type", "buyer type", "customer group", "sales channel", "channel", "type", "b2b b2c", "b2c", "b2b"],
         negative=["status", "alert", "vehicle", "item", "product", "xe"]),
-    "alert_status": dict(label="Tình trạng (Alert/Normal)", aliases=[
+    "alert_status": dict(aliases=[
         "tình trạng alert", "cảnh báo", "alert", "alert status", "normal alert", "mức độ ưu tiên", "độ ưu tiên", "ưu tiên",
         "mức độ khẩn", "khẩn cấp", "gấp", "priority", "urgent", "severity", "flag", "express", "rush", "sla"],
         negative=[]),
-    "order_date": dict(label="Ngày đơn / ngày giao", aliases=[
+    "order_date": dict(aliases=[
         "ngày đặt", "ngày đặt hàng", "ngày tạo đơn", "ngày tạo", "ngày đơn", "ngày giao", "ngày giao hàng",
         "ngày giao dự kiến", "thời gian đặt", "ngày", "order date", "created date", "created at", "delivery date",
         "ship date", "expected delivery", "planned date", "due date", "date", "timestamp"],
         negative=[]),
 }
+ORDER_FIELDS = {}
+for _f, _v in _ORDER_RAW.items():
+    ORDER_FIELDS[_f] = dict(label=_f, aliases=[_f] + _v["aliases"], negative=_v["negative"])  # tên cột DIM luôn là alias
 FIELDS = list(ORDER_FIELDS)
 ALIAS_N = {f: [a for a in (norm(x) for x in v["aliases"]) if a] for f, v in ORDER_FIELDS.items()}
 NEG_N = {f: [n for n in (norm(x) for x in v["negative"]) if n] for f, v in ORDER_FIELDS.items()}
-# ==========================================================
-# 3. TỪ ĐIỂN GIÁ TRỊ (Individual -> B2C, Business -> B2B, ...)
-# ==========================================================
+
 TYPE_TABLE = {
     "B2C": ["b2c", "c", "individual", "individuals", "person", "personal", "private", "private customer", "consumer",
             "retail", "retail customer", "end user", "enduser", "household", "home", "home delivery", "d2c",
@@ -937,6 +981,8 @@ STATUS_TABLE = {
                       "giao không thành công", "bom hàng"],
     "Trả hàng": ["returned", "return", "refund", "refunded", "trả hàng", "hoàn hàng", "hoàn trả", "hoàn tiền", "đã trả"],
 }
+
+
 def build_lookup(table):
     exact = {}
     for label, keys in table.items():
@@ -946,10 +992,13 @@ def build_lookup(table):
     cont = sorted(((k, l, re.compile(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])"))
                    for k, l in exact.items() if len(k) >= 3), key=lambda x: -len(x[0]))
     return {"exact": exact, "cont": cont, "keys": [k for k in exact if len(k) >= 4]}
+
+
 TYPE_LK, ALERT_LK, STATUS_LK = build_lookup(TYPE_TABLE), build_lookup(ALERT_TABLE), build_lookup(STATUS_TABLE)
 DICT_LOOKUPS = {"order_type": TYPE_LK, "alert_status": ALERT_LK, "order_status": STATUS_LK}
+
+
 def match_label(value, lk, fuzzy_cut=88):
-    """Trả (nhãn chuẩn, cách khớp, từ khóa) hoặc None. Khớp: chính xác > chứa từ khóa dài nhất > fuzzy."""
     n = norm(to_text(value))
     if not n: return None
     if n in lk["exact"]: return lk["exact"][n], "khớp từ điển", n
@@ -963,12 +1012,12 @@ def match_label(value, lk, fuzzy_cut=88):
         if r and r[1] >= fuzzy_cut:
             return lk["exact"][r[0]], f"gần đúng {r[1]:.0f}% với '{r[0]}'", r[0]
     return None
+
+
 B2B_NAME_RX = re.compile(r"(?<![a-z0-9])(cong ty|ctcp|tnhh|co phan|joint stock|jsc|ltd|llc|corp|corporation|inc|company|"
                          r"doanh nghiep|dai ly|nha phan phoi|npp|tap doan|nha hang|khach san|sieu thi|cua hang|"
                          r"xi nghiep|nha may|ngan hang|bank|group|holdings|enterprise|trading|logistics)(?![a-z0-9])")
-# ==========================================================
-# 4. ĐỌC SỐ + ĐƠN VỊ (kg, tấn, g, m3, lít, kích thước DxRxC)
-# ==========================================================
+
 NUM_RE = re.compile(r"[-+]?\d[\d.,]*")
 WEIGHT_UNITS = {"kg": 1, "kgs": 1, "kilogram": 1, "kilograms": 1, "ky": 1, "g": 1e-3, "gr": 1e-3, "gam": 1e-3,
                 "gram": 1e-3, "grams": 1e-3, "mg": 1e-6, "t": 1000, "tan": 1000, "tonne": 1000, "tonnes": 1000,
@@ -981,6 +1030,8 @@ WUNIT_RX = re.compile(r"\d\s*(kg|kgs|g|gr|gam|gram|mg|tan|ta|yen|lb|lbs|t)\b")
 VUNIT_RX = re.compile(r"\d\s*(m3|cbm|cm3|cc|ml|dm3|l|lit|ft3)\b|\d\s*[x*]\s*\d")
 DIM_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*[x*]\s*(\d+(?:[.,]\d+)?)\s*[x*]\s*(\d+(?:[.,]\d+)?)\s*([a-z]*)")
 LEN_UNITS = {"mm": 1e-3, "cm": 1e-2, "dm": 1e-1, "m": 1.0}
+
+
 def _to_float(tok):
     t = tok.strip().rstrip(".,")
     neg = t.startswith("-")
@@ -996,10 +1047,13 @@ def _to_float(tok):
     try: v = float(t)
     except ValueError: return None
     return -v if neg else v
+
+
 def _ascii(v):
     return unidecode(str(v)).lower().replace("^", "").replace("×", "x")
+
+
 def parse_measure(val, units):
-    """-> (giá trị đã quy đổi hoặc None, ghi chú quy đổi)."""
     if is_blank(val): return None, ""
     if isinstance(val, (int, float, np.number)) and not isinstance(val, (bool, np.bool_)):
         return float(val), ""
@@ -1016,6 +1070,8 @@ def parse_measure(val, units):
         factor = units[cands[0]] if cands else None
     if factor is None: return num, f"đơn vị lạ '{rest}', giữ nguyên số"
     return num * factor, ("" if factor == 1 else f"quy đổi '{to_text(val)}'")
+
+
 def parse_volume(val):
     if is_blank(val): return None, ""
     if isinstance(val, (int, float, np.number)) and not isinstance(val, (bool, np.bool_)):
@@ -1029,25 +1085,28 @@ def parse_volume(val):
             f = LEN_UNITS.get(unit, 1e-2 if max(a, b, c) > 5 else 1.0)
             return a * b * c * f ** 3, f"tính từ kích thước '{to_text(val)}'"
     return parse_measure(val, VOLUME_UNITS)
+
+
 def parse_date_iso(v):
     if is_blank(v): return ""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         d = pd.to_datetime(v, errors="coerce", dayfirst=True)
     return "" if pd.isna(d) else d.strftime("%Y-%m-%d")
-# ==========================================================
-# 5. CHẤM ĐIỂM ÁNH XẠ CỘT = TÊN CỘT + NỘI DUNG CỘT
-# ==========================================================
+
+
 ID_RE = re.compile(r"^[A-Za-z]{0,10}[-_/ ]?\d{2,}[A-Za-z0-9\-_/]*$")
 DATE_RX = re.compile(r"\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}")
 ADDR_TOKENS = ["duong", "pho", "phuong", "quan", "huyen", "tinh", "tp", "thanh pho", "thon", "ngo", "ngach", "hem",
                "xom", "khu pho", "street", "road", "rd", "ward", "district", "city", "avenue", "lane", "ha noi",
                "ho chi minh", "tphcm", "hcm", "da nang", "viet nam", "vietnam"]
 STRONG_CONTENT = {"order_type", "alert_status", "order_status", "order_date", "address"}
+
+
 def name_score(col, field):
     n = norm(col)
     if not n: return 0.0
-    nc, toks = n.replace(" ", ""), n.split()
+    nc = n.replace(" ", "")
     best = 0.0
     for a in ALIAS_N[field]:
         ac = a.replace(" ", "")
@@ -1059,13 +1118,17 @@ def name_score(col, field):
         else: s = 0.0
         best = max(best, s)
     if any(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", n) for t in NEG_N[field]):
-        best *= 0.45
+        if nc != norm(field).replace(" ", ""):      # cột trùng đúng tên chuẩn thì không bị trừ điểm
+            best *= 0.45
     return min(best, 1.0)
+
+
 def _is_addr(t):
     n = " " + norm(t) + " "
     return any(f" {tok} " in n for tok in ADDR_TOKENS) or (t.count(",") >= 2 and len(t) > 15)
+
+
 def content_score(texts, field):
-    """Điểm 0..1 dựa trên GIÁ TRỊ trong cột (texts đã là list chuỗi, tối đa 300 dòng)."""
     n = len(texts)
     if n == 0: return 0.0
     uniq = len(set(texts)) / n
@@ -1084,10 +1147,10 @@ def content_score(texts, field):
     if field == "items":
         return frac(lambda t: any(ch.isalpha() for ch in t) and len(t) >= 3 and not _is_addr(t)) * \
                (0.7 if frac(lambda t: "," in t or " x " in t.lower()) >= 0.3 else 0.4)
-    if field == "total_weight":
+    if field == "total_weight_kg":
         if frac(lambda t: bool(WUNIT_RX.search(_ascii(t)))) >= 0.5: return 0.95
         return 0.3 * frac(lambda t: parse_measure(t, WEIGHT_UNITS)[0] is not None)
-    if field == "total_volume":
+    if field == "total_volume_m3":
         if frac(lambda t: bool(VUNIT_RX.search(_ascii(t)))) >= 0.5: return 0.95
         return 0.3 * frac(lambda t: parse_measure(t, VOLUME_UNITS)[0] is not None)
     if field == "address":
@@ -1099,19 +1162,22 @@ def content_score(texts, field):
                 warnings.simplefilter("ignore")
                 return not pd.isna(pd.to_datetime(t, errors="coerce", dayfirst=True))
         return frac(ok)
-    if field in DICT_LOOKUPS:                       # type / alert / status: tỉ lệ giá trị khớp từ điển
+    if field in DICT_LOOKUPS:
         vc = Counter(texts)
         hit = sum(c for v, c in vc.items()
                   if len(norm(v)) >= 2 and any(ch.isalpha() for ch in v) and match_label(v, DICT_LOOKUPS[field]))
         return hit / n
     return 0.0
+
+
 def combine(ns, cs, field):
     s = 0.6 * ns + 0.4 * cs
     if field in STRONG_CONTENT and cs >= 0.8:
         s = max(s, 0.55 * cs + 0.30 * ns + 0.10)
     return s
+
+
 def orders_semantic_mapping(df):
-    """Chọn cặp (trường, cột) điểm cao nhất toàn cục -> {field: (cột, điểm, căn cứ)}."""
     samples = {c: [t for t in (to_text(v) for v in df[c].dropna().head(300)) if t] for c in df.columns}
     cands = []
     for field in FIELDS:
@@ -1127,11 +1193,10 @@ def orders_semantic_mapping(df):
         result[field] = (col, score, f"tên cột {ns:.0%} · nội dung {cs:.0%}")
         used_f.add(field); used_c.add(col)
     return result
-# ==========================================================
-# 6. CHUẨN HÓA 1 ĐƠN
-# ==========================================================
+
+
 def process_order(raw, reports):
-    """raw: {field: giá trị gốc hoặc None}. reports: Counter ghi lại các phép chuẩn hóa giá trị."""
+    """raw: {tên_cột_DIM: giá trị gốc}. Đầu ra luôn đủ 12 cột chuẩn DIM_ORDERS (+ ghi_chú)."""
     notes = []
     def log(field, original, standard, how):
         if to_text(original) != standard:
@@ -1139,7 +1204,6 @@ def process_order(raw, reports):
     r_name = to_text(raw.get("customer_name"))
     name_b2b = bool(B2B_NAME_RX.search(norm(r_name)))
     cust_name = r_name or "Khách lẻ"
-    # --- Loại đơn: Individual->B2C, Business->B2B ...
     r_type = to_text(raw.get("order_type"))
     if r_type:
         m = match_label(r_type, TYPE_LK)
@@ -1157,7 +1221,6 @@ def process_order(raw, reports):
     else:
         t_type = "B2B" if name_b2b else "B2C"
         if name_b2b: log("order_type", "(trống)", t_type, "suy từ tên khách")
-    # --- Alert / Normal
     r_alert = to_text(raw.get("alert_status"))
     if r_alert:
         m = match_label(r_alert, ALERT_LK)
@@ -1167,7 +1230,6 @@ def process_order(raw, reports):
             notes.append(f"⚠️ Không nhận diện mức cảnh báo '{r_alert}' → mặc định Normal")
     else:
         t_alert = "Normal"
-    # --- Tình trạng đơn
     r_status = to_text(raw.get("order_status"))
     if r_status:
         m = match_label(r_status, STATUS_LK)
@@ -1175,18 +1237,17 @@ def process_order(raw, reports):
         else: status = r_status
     else:
         status = "Mới tạo"
-    # --- Số lượng, trọng lượng, thể tích
     q, _ = parse_measure(raw.get("quantity"), {})
     quantity = max(int(q), 1) if q is not None else 1
-    w, w_note = parse_measure(raw.get("total_weight"), WEIGHT_UNITS)
-    if w_note and "quy đổi" in w_note: log("total_weight", raw.get("total_weight"), f"{w:g} kg", w_note)
+    w, w_note = parse_measure(raw.get("total_weight_kg"), WEIGHT_UNITS)
+    if w_note and "quy đổi" in w_note: log("total_weight_kg", raw.get("total_weight_kg"), f"{w:g} kg", w_note)
     elif w_note: notes.append(f"⚠️ Trọng lượng: {w_note}")
-    v, v_note = parse_volume(raw.get("total_volume"))
-    if v_note and ("quy đổi" in v_note or "tính từ" in v_note): log("total_volume", raw.get("total_volume"), f"{v:.4g} m3", v_note)
+    v, v_note = parse_volume(raw.get("total_volume_m3"))
+    if v_note and ("quy đổi" in v_note or "tính từ" in v_note): log("total_volume_m3", raw.get("total_volume_m3"), f"{v:.4g} m3", v_note)
     elif v_note: notes.append(f"⚠️ Thể tích: {v_note}")
-    if not is_blank(raw.get("total_weight")) and w is None: notes.append("⚠️ Không đọc được trọng lượng → 0")
-    if not is_blank(raw.get("total_volume")) and v is None: notes.append("⚠️ Không đọc được thể tích → 0")
-    rec = {
+    if not is_blank(raw.get("total_weight_kg")) and w is None: notes.append("⚠️ Không đọc được trọng lượng → 0")
+    if not is_blank(raw.get("total_volume_m3")) and v is None: notes.append("⚠️ Không đọc được thể tích → 0")
+    return {
         "order_id": to_text(raw.get("order_id")),
         "customer_id": to_text(raw.get("customer_id")),
         "customer_name": cust_name,
@@ -1198,57 +1259,57 @@ def process_order(raw, reports):
         "order_status": status,
         "order_type": t_type,
         "alert_status": t_alert,
+        "order_date": parse_date_iso(raw.get("order_date")),   # luôn có cột này để Tab 6 gom theo ngày
+        "ghi_chú": " | ".join(notes),
     }
-    if "order_date" in raw and raw["order_date"] is not None:
-        rec["order_date"] = parse_date_iso(raw["order_date"])
-    rec["ghi_chú"] = " | ".join(notes)
-    return rec
+
+
 def orders_validate_output(df):
     out = df.copy().reset_index(drop=True)
     dup = out["order_id"].astype(str).duplicated(keep=False)
     msgs = []
     for i, row in out.iterrows():
         errs, warns = [], []
-        if is_blank(row.get("order_id")): errs.append("Thiếu Mã đơn")
-        if is_blank(row.get("address")): errs.append("Thiếu Địa chỉ")
-        if dup.iloc[i] and not is_blank(row.get("order_id")): errs.append("Trùng Mã đơn")
-        if is_blank(row.get("customer_id")): warns.append("Thiếu Mã khách")
-        if parse_measure(row.get("total_weight_kg"), {})[0] in (None, 0.0): warns.append("Trọng lượng = 0")
-        if parse_measure(row.get("total_volume_m3"), {})[0] in (None, 0.0): warns.append("Thể tích = 0")
+        if is_blank(row.get("order_id")): errs.append("Thiếu order_id")
+        if is_blank(row.get("address")): errs.append("Thiếu address")
+        if dup.iloc[i] and not is_blank(row.get("order_id")): errs.append("Trùng order_id")
+        if is_blank(row.get("customer_id")): warns.append("Thiếu customer_id")
+        if parse_measure(row.get("total_weight_kg"), {})[0] in (None, 0.0): warns.append("total_weight_kg = 0")
+        if parse_measure(row.get("total_volume_m3"), {})[0] in (None, 0.0): warns.append("total_volume_m3 = 0")
         warns += [n.replace("⚠️ ", "") for n in str(row.get("ghi_chú", "")).split(" | ") if n.startswith("⚠️")]
         if errs: msgs.append("❌ " + "; ".join(errs + warns))
         elif warns: msgs.append("⚠️ " + "; ".join(warns))
         else: msgs.append("✅ Đủ dữ liệu đơn hàng chuẩn")
     out["kiểm_tra"] = msgs
     return out
+
+
 def conf_icon(s):
     return "🟢" if s >= 0.75 else ("🟡" if s >= 0.55 else "🟠")
 
 
 def orders_empty_table():
     return pd.DataFrame({
-        "Mã đơn": ["ORD_001", "ORD_002", "ORD_003", "ORD_004"],
-        "Mã khách": ["CUS_01", "CUS_02", "CUS_03", "CUS_04"],
-        "Tên khách": ["Nguyễn Văn A", "Công ty TNHH Nội Thất Việt", "Trần Thị B", "Đại lý Minh Phát"],
-        "Số lượng": [2, 10, 1, 6],
-        "Mặt hàng": ["Ghế sofa, Bàn trà", "Bàn làm việc", "Tủ quần áo", "Giường gỗ"],
-        "Tổng trọng lượng (kg)": [45.5, 320.0, 80.0, 450.0],
-        "Tổng thể tích (m3)": [0.8, 6.5, 1.2, 5.0],
-        "Địa chỉ khách": [
+        "order_id": ["ORD_001", "ORD_002", "ORD_003", "ORD_004"],
+        "customer_id": ["CUS_01", "CUS_02", "CUS_03", "CUS_04"],
+        "customer_name": ["Nguyễn Văn A", "Công ty TNHH Nội Thất Việt", "Trần Thị B", "Đại lý Minh Phát"],
+        "quantity": [2, 10, 1, 6],
+        "items": ["Ghế sofa, Bàn trà", "Bàn làm việc", "Tủ quần áo", "Giường gỗ"],
+        "total_weight_kg": [45.5, 320.0, 80.0, 450.0],
+        "total_volume_m3": [0.8, 6.5, 1.2, 5.0],
+        "address": [
             "Số 88 - Đường Cổ Linh - Long Biên - Hà Nội",
             "Số 1 Đường Trần Duy Hưng, Cầu Giấy, Hà Nội",
             "Số 25 Đường Láng Hạ, Đống Đa, Hà Nội",
             "Số 120 Đường Nguyễn Trãi, Thanh Xuân, Hà Nội",
         ],
-        "Tình trạng đơn": ["Đang xử lý", "Mới tạo", "New", "Shipping"],
-        "Loại đơn": ["Individual", "Business", "Retail", "Distributor"],
-        "Tình trạng Alert": ["Normal", "Urgent", "Normal", "High"],
+        "order_status": ["Đang xử lý", "Mới tạo", "New", "Shipping"],
+        "order_type": ["Individual", "Business", "Retail", "Distributor"],
+        "alert_status": ["Normal", "Urgent", "Normal", "High"],
+        "order_date": ["2026-04-03"] * 4,
     })
 
 
-# ============================================================================
-# TAB 5 — UI
-# ============================================================================
 def render_orders_tab():
     st.header("🧾 Smart Logistics — Quản lý & Chuẩn hóa Đơn hàng")
     st.markdown("**Input → Semantic Mapping (cột + giá trị) → Làm sạch → Validate → Export Excel/JSON**")
@@ -1263,11 +1324,10 @@ def render_orders_tab():
             rows = []
             for fld in FIELDS:
                 col = st.session_state.get(f"orders_col_{fld}", NONE)
-                label = ORDER_FIELDS[fld]["label"]
                 if col == NONE:
-                    rows.append({"Trường": label, "Cột được chọn": "(không tìm thấy)", "Độ tin cậy": "–", "Căn cứ": "–"})
+                    rows.append({"Trường (cột DIM_ORDERS)": fld, "Cột trong file": "(không tìm thấy)", "Độ tin cậy": "–", "Căn cứ": "–"})
                 else:
-                    rows.append({"Trường": label, "Cột được chọn": col,
+                    rows.append({"Trường (cột DIM_ORDERS)": fld, "Cột trong file": col,
                                  "Độ tin cậy": f"{conf_icon(meta[fld])} {meta[fld]:.0%}", "Căn cứ": why[fld]})
             st.session_state["orders_auto_table"] = pd.DataFrame(rows)
 
@@ -1279,11 +1339,10 @@ def render_orders_tab():
     if auto is not None:
         st.dataframe(auto)
         st.caption("🟢 chắc chắn · 🟡 nên kiểm tra · 🟠 độ tin cậy thấp — bạn có thể đổi trong các ô bên dưới.")
-    st.markdown("### 🔗 Kiểm tra ánh xạ cột (cột nào không có chọn '-- Không sử dụng --')")
+    st.markdown("### 🔗 Kiểm tra ánh xạ cột (tên trường = tên cột trong `DIM_ORDERS`)")
     st.caption("Xem trước dữ liệu gốc (8 dòng đầu)")
     st.dataframe(raw.head(8))
-    specs = [(f, ORDER_FIELDS[f]["label"]) for f in FIELDS]
-    chosen = render_mapping("orders", specs, raw)
+    chosen = render_mapping("orders", FIELDS, raw)
 
     if st.button("🚀 Chuẩn hóa & Xử lý Đơn hàng", key="orders_process", type="primary"):
         try:
@@ -1297,8 +1356,8 @@ def render_orders_tab():
             n_b2b = int((out["order_type"] == "B2B").sum())
             n_alert = int((out["alert_status"] == "Alert").sum())
             rep = pd.DataFrame(
-                [{"Trường": ORDER_FIELDS[f]["label"], "Giá trị gốc": o, "Chuẩn hóa thành": s,
-                  "Cách nhận diện": h, "Số dòng": n} for (f, o, s, h), n in reports.most_common()],
+                [{"Trường": f, "Giá trị gốc": o, "Chuẩn hóa thành": s, "Cách nhận diện": h, "Số dòng": n}
+                 for (f, o, s, h), n in reports.most_common()],
                 columns=["Trường", "Giá trị gốc", "Chuẩn hóa thành", "Cách nhận diện", "Số dòng"])
             files = save_outputs(OUT_ORDERS, "DIM_ORDERS", "DIM_ORDERS", out, extra_sheets={"VALUE_MAPPING": rep})
             store_result(
@@ -1319,210 +1378,78 @@ def render_orders_tab():
 
 
 # ============================================================================
-# TAB 6 — LOGIC ĐỊNH TUYẾN (đọc input từ các thư mục output_*)
+# TAB 6 — CHỜ CODE (chỉ hiển thị "hợp đồng" schema đầu vào chuẩn)
 # ============================================================================
-@dataclass
-class Config:
-    order_file: str = os.path.join(OUT_ORDERS, "DIM_ORDERS.xlsx")
-    vehicle_file: str = os.path.join(OUT_FLEET, "DIM_VEHICLE.xlsx")
-    driver_file: str = os.path.join(OUT_DRIVER, "DIM_DRIVER.xlsx")
-    warehouse_file: str = os.path.join(OUT_WAREHOUSE, "WAREHOUSE_WITH_COORDINATES.xlsx")
-    product_file: str = os.path.join(OUT_PRODUCT, "DIM_PRODUCT.xlsx")
-    matrix_file: str = os.path.join(OUT_MATRIX, "DISTANCE_MATRIX_KM.xlsx")
-    cust_file: str = os.path.join(OUT_CUSTOMER, "DATASET_CUSTOMER.xlsx")
-    output_daily_file: str = os.path.join(OUT_CUSTOMER, "DIM_CUSTOMER.xlsx")
-    start_time: str = "08:30"
-    max_route_hours: float = 8.0
-    detour_factor: float = 1.2
-    service_min: dict = dc_field(default_factory=lambda: {"B2B": 105, "B2C": 60})
-    fixed_cost_col: str | None = None
-    variable_cost_col: str | None = None
-    overnight_cost: float = 300_000
-    backup_driver_cost: float = 400_000
-    late_penalty_per_day: float = 100_000
+SCHEMA_CONTRACT = {
+    "output_fleet/DIM_VEHICLE.xlsx": list(VEHICLE_FIELDS),
+    "output_warehouse/WAREHOUSE_WITH_COORDINATES.xlsx": ["id_warehouse", "address", "lat", "lng"],
+    "output_product/DIM_PRODUCT.xlsx": list(PRODUCT_FIELDS),
+    "output_driver/DIM_DRIVER.xlsx": list(DRIVER_FIELDS),
+    "output_orders/DIM_ORDERS.xlsx": FIELDS,
+}
 
 
-CFG = Config()
+def render_routing_placeholder():
+    st.header("🗺️ Dashboard Định tuyến (Clarke-Wright) — chưa code")
+    st.info("Tab 6 sẽ đọc đúng các cột chuẩn dưới đây (khóa nối: `id_warehouse`, `customer_id`) "
+            "bằng `read_dim_file()` — đã cache + ép kiểu nhỏ.")
+    rows = []
+    for path, cols in SCHEMA_CONTRACT.items():
+        full = os.path.join(BASE_DIR, path)
+        status, n_rows, missing = "❌ Chưa có", "", ""
+        if os.path.exists(full):
+            try:
+                df = read_dim_file(full)
+                n_rows = len(df)
+                lack = [c for c in cols if c not in df.columns]
+                status = "✅ Đủ cột chuẩn" if not lack else "⚠️ Thiếu cột"
+                missing = ", ".join(lack)
+            except Exception as exc:
+                status = f"❌ Không đọc được: {exc}"
+        rows.append({"File": path, "Trạng thái": status, "Số dòng": n_rows, "Cột thiếu": missing,
+                     "Cột chuẩn": ", ".join(cols)})
+    st.dataframe(pd.DataFrame(rows), hide_index=True)
 
 
-def haversine(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0
-    dlat, dlon = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    return R * 2 * math.asin(math.sqrt(a))
+# ============================================================================
+# MAIN
+# ============================================================================
+TAB_NAMES = [
+    "🚚 1. Hạm đội xe (Fleet)",
+    "🏭 2. Kho & Tọa độ (Warehouse)",
+    "📦 3. Sản phẩm (Product)",
+    "👨‍✈️ 4. Tài xế (Driver)",
+    "🧾 5. Đơn hàng (Orders)",
+    "🗺️ 6. Định tuyến (chờ code)",
+]
 
 
-def first_col(df: pd.DataFrame, *names):
-    for n in names:
-        if n in df.columns:
-            return n
-    return None
+def main():
+    st.title("🚚 Smart Logistics — Quản lý & Chuẩn hóa dữ liệu")
+    with st.sidebar:
+        st.markdown("### ℹ️ Hướng dẫn nhanh")
+        st.markdown("1. Điền / upload dữ liệu ở **Tab 1 → 5**, bấm *Quét* rồi *Chuẩn hóa & Xử lý*.\n"
+                    "2. Tên trường ánh xạ **trùng tên cột** của file DIM xuất ra.\n"
+                    "3. Kết quả tự lưu vào `output_fleet`, `output_warehouse`, `output_product`, "
+                    "`output_driver`, `output_orders`.")
+        if st.button("🧹 Giải phóng RAM (xoá cache + dữ liệu tạm)", key="free_ram"):
+            st.cache_data.clear()
+            for k in list(st.session_state):
+                if k.endswith(("_raw", "_result", "_meta", "_why", "_auto_table")):
+                    st.session_state.pop(k, None)
+            st.rerun()
+        st.caption("⚠️ Ổ đĩa Streamlit Cloud là tạm thời và dùng chung giữa các phiên — hãy tải file về nếu cần lưu lâu dài.")
+    tabs = st.tabs(TAB_NAMES)
+    with tabs[0]: render_fleet_tab()
+    with tabs[1]: render_warehouse_tab()
+    with tabs[2]: render_product_tab()
+    with tabs[3]: render_driver_tab()
+    with tabs[4]: render_orders_tab()
+    with tabs[5]: render_routing_placeholder()
 
 
-def money(x) -> str:
-    return f"{x:,.0f}"
-
-
-def _positive(series, default):
-    """Số > 0, ngược lại (NaN / 0 / âm) dùng giá trị mặc định."""
-    s = pd.to_numeric(series, errors="coerce")
-    return s.where(s > 0).fillna(default)
-
-
-def _num(x, default=0.0) -> float:
-    v = pd.to_numeric(x, errors="coerce")
-    return float(default if pd.isna(v) else v)
-
-
-def read_matrix(path) -> pd.DataFrame:
-    df = pd.read_excel(path, index_col=0)
-    df.index = df.index.astype(str).str.strip()
-    df.columns = df.columns.astype(str).str.strip()
-    return df
-
-
-def resolve_customer_file(cfg: Config) -> str:
-    """Tìm DATASET_CUSTOMER.xlsx; nếu không có, tự dò file .xlsx bất kỳ trong output_customer."""
-    if os.path.exists(cfg.cust_file):
-        return cfg.cust_file
-    folder = os.path.dirname(cfg.cust_file)
-    if os.path.isdir(folder):
-        cands = sorted(f for f in os.listdir(folder) if f.endswith(".xlsx") and not f.startswith("~"))
-        if cands:
-            return os.path.join(folder, cands[0])
-    raise UserError("Không tìm thấy dữ liệu khách hàng trong `output_customer/`. Hãy chạy bước 1 (Geocode khách hàng) trước.")
-
-
-def load_warehouse_coords(cfg: Config) -> dict:
-    """Đọc toạ độ kho đã geocode ở Tab 2 -> {id_kho: (lat, lon)}."""
-    coords = {}
-    if not os.path.exists(cfg.warehouse_file):
-        return coords
-    df_wh = pd.read_excel(cfg.warehouse_file)
-    wid = first_col(df_wh, "id_warehouse", "warehouse_id", "wh_id", "depot_id")
-    lat_c = first_col(df_wh, "lat", "latitude", "LATITUDE")
-    lon_c = first_col(df_wh, "lng", "lon", "longitude", "LONGITUDE")
-    if not (wid and lat_c and lon_c):
-        return coords
-    for _, r in df_wh.iterrows():
-        if pd.notna(r[wid]) and pd.notna(r[lat_c]) and pd.notna(r[lon_c]):
-            coords[str(r[wid]).strip()] = (float(r[lat_c]), float(r[lon_c]))
-    return coords
-
-
-def load_data(cfg: Config = CFG) -> dict:
-    notes = []
-    df_orders = pd.read_excel(cfg.order_file)
-    df_veh = pd.read_excel(cfg.vehicle_file).copy()
-    df_driver = pd.read_excel(cfg.driver_file).copy()
-    df_dist = read_matrix(cfg.matrix_file)
-    df_cust = pd.read_excel(resolve_customer_file(cfg))
-    wh_coords = load_warehouse_coords(cfg)
-
-    if df_orders.empty:
-        raise UserError("DIM_ORDERS.xlsx không có đơn hàng — hãy xử lý đơn hàng ở Tab 5.")
-    if df_veh.empty:
-        raise UserError("DIM_VEHICLE.xlsx không có xe — hãy khai báo hạm đội ở Tab 1.")
-
-    # --- Trích xuất linh hoạt cột từ dữ liệu xe (bổ sung tên cột của DIM_VEHICLE: id_warehouse,
-    #     average_speed_kmh, variable_cost) ---
-    veh_id_col = first_col(df_veh, "vehicle_id", "VEHICLE_ID", "id")
-    plate_col = first_col(df_veh, "license_plate", "bien_so", "plate", "vehicle_id")
-    type_col = first_col(df_veh, "vehicle_type", "type", "vehicle_class", "vehicle_name")
-    wh_col = first_col(df_veh, "wh_id", "warehouse_id", "depot_id", "id_warehouse")
-    speed_col = first_col(df_veh, "speed_kmh", "speed", "vận_tốc", "average_speed_kmh")
-    w_col = first_col(df_veh, "max_weight_kg", "weight_capacity", "max_weight", "capacity_kg")
-    v_col = first_col(df_veh, "max_volume_m3", "volume_capacity", "max_volume", "capacity_m3")
-
-    df_veh["vehicle_id"] = df_veh[veh_id_col].astype(str) if veh_id_col else [f"VEH_{i}" for i in range(len(df_veh))]
-    df_veh["license_plate"] = df_veh[plate_col].astype(str) if plate_col else df_veh["vehicle_id"]
-    wh_series = df_veh[wh_col].astype(str).str.strip() if wh_col else pd.Series("WH_DEFAULT", index=df_veh.index)
-    df_veh["wh_id"] = wh_series.replace({"": "WH_DEFAULT", "nan": "WH_DEFAULT", "None": "WH_DEFAULT"})
-    df_veh["speed_kmh"] = _positive(df_veh[speed_col], 35.0) if speed_col else 35.0
-    df_veh["max_weight_kg"] = _positive(df_veh[w_col], 1000.0) if w_col else 1000.0
-    df_veh["max_volume_m3"] = _positive(df_veh[v_col], 5.0) if v_col else 5.0
-    if type_col:
-        df_veh["vehicle_type"] = df_veh[type_col].astype(str).str.strip()
-    else:  # DIM_VEHICLE không có loại xe -> phân loại theo trọng tải
-        df_veh["vehicle_type"] = df_veh["max_weight_kg"].map(lambda w: f"Xe {w:g}kg")
-
-    fx_col = cfg.fixed_cost_col or first_col(df_veh, "fixed_cost", "fixed_cost_per_day")
-    vr_col = cfg.variable_cost_col or first_col(df_veh, "variable_cost_per_km", "cost_per_km", "variable_cost")
-    df_veh["fixed_cost"] = pd.to_numeric(df_veh[fx_col], errors="coerce").fillna(300_000.0) if fx_col else 300_000.0
-    df_veh["variable_cost_per_km"] = pd.to_numeric(df_veh[vr_col], errors="coerce").fillna(8_000.0) if vr_col else 8_000.0
-
-    # --- Kho: danh sách kho lấy từ xe, toạ độ lấy từ output_warehouse (nếu có) ---
-    warehouses, no_coord = {}, []
-    for wh in df_veh["wh_id"].unique():
-        if wh in wh_coords:
-            lat, lon = wh_coords[wh]
-        else:
-            lat, lon = DEFAULT_DEPOT
-            no_coord.append(wh)
-        warehouses[wh] = {"name": f"Kho {wh}", "lat": lat, "lon": lon}
-    if no_coord:
-        notes.append("Kho chưa có toạ độ trong `output_warehouse` (dùng toạ độ mặc định Hà Nội "
-                     f"{DEFAULT_DEPOT}): {', '.join(map(str, no_coord))}. Hãy khớp **ID kho** ở Tab 1 với **Mã kho** ở Tab 2.")
-
-    # --- Tài xế theo kho ---
-    d_name_col = first_col(df_driver, "driver_name", "name", "full_name", "TÊN", "driver_id")
-    d_role_col = first_col(df_driver, "role", "position", "VAI_TRÒ", "type")
-    d_wh_col = first_col(df_driver, "wh_id", "warehouse_id", "depot_id", "KHO", "id_warehouse")
-    df_driver["driver_name"] = df_driver[d_name_col].astype(str) if d_name_col else "Tài xế"
-    df_driver["role"] = df_driver[d_role_col].astype(str).str.strip().str.capitalize() if d_role_col else "Chính"
-    df_driver["wh_id"] = df_driver[d_wh_col].astype(str).str.strip() if d_wh_col else list(warehouses.keys())[0]
-    drivers_by_wh = {}
-    for wh in warehouses:
-        sub = df_driver[df_driver["wh_id"] == wh]
-        chính = sub[sub["role"].str.contains("Chính|Primary|Driver", case=False, na=False)]["driver_name"].tolist()
-        phụ = sub[sub["role"].str.contains("Phụ|Assistant|Helper|Hỗ trợ|Support", case=False, na=False)]["driver_name"].tolist()
-        if not chính:
-            chính = sub["driver_name"].tolist() or ["Tài xế chính"]
-        if not phụ:
-            phụ = ["Phụ xe hỗ trợ"]
-        if sub.empty:
-            notes.append(f"Kho {wh}: không có tài xế nào khai báo ở Tab 4 (sẽ dùng tài xế dự phòng).")
-        drivers_by_wh[wh] = {"chính": chính, "phụ": phụ}
-
-    # --- Khách hàng (chỉ giữ khách có toạ độ hợp lệ; khách thiếu toạ độ sẽ rơi vào nhóm ngoại lệ) ---
-    addr_col = first_col(df_cust, "address", "Location", "ADDRESS")
-    lat_col = first_col(df_cust, "lat", "LATITUDE", "latitude")
-    lon_col = first_col(df_cust, "lng", "lon", "LONGITUDE", "longitude")
-    cid_col = first_col(df_cust, "customer_id", "CUSTOMER_ID", "id")
-    cust = {}
-    for idx, r in df_cust.iterrows():
-        cid = str(r[cid_col]).strip() if cid_col and pd.notna(r[cid_col]) else str(idx)
-        if not (lat_col and lon_col) or pd.isna(r[lat_col]) or pd.isna(r[lon_col]):
-            continue
-        cust[cid] = {
-            "lat": float(r[lat_col]), "lon": float(r[lon_col]),
-            "address": str(r[addr_col]) if addr_col and pd.notna(r[addr_col]) else "",
-        }
-
-    # --- Đơn hàng ---
-    oid_c = first_col(df_orders, "order_id", "ORDER_ID")
-    date_c = first_col(df_orders, "order_date", "delivery_date", "date", "NGÀY")
-    wait_c = first_col(df_orders, "waiting_date", "WAITING_DATE")
-    orders = []
-    for i, r in df_orders.iterrows():
-        cid_raw = r.get("customer_id")
-        cid = "" if pd.isna(cid_raw) else str(cid_raw).strip()
-        dt_val = pd.to_datetime(r[date_c], errors="coerce") if date_c and pd.notna(r.get(date_c)) else pd.NaT
-        if pd.isna(dt_val):
-            dt_val = pd.Timestamp.today()
-        wait_val = pd.to_datetime(r[wait_c], errors="coerce") if wait_c and pd.notna(r[wait_c]) else pd.NaT
-        orders.append({
-            "ORDER_ID": str(r[oid_c]) if oid_c and pd.notna(r.get(oid_c)) else f"OR{i}",
-            "customer_id": cid,
-            "weight": _num(r.get("total_weight_kg", 0.0)),
-            "volume": _num(r.get("total_volume_m3", 0.0)),
-            "order_type": str(r.get("order_type", "B2C")),
-            "date": str(dt_val.date()),
-            "WAITING_DATE": None if pd.isna(wait_val) else str(wait_val.date()),
-            "Location": cust.get(cid, {}).get("address", ""),
-        })
-    return {"orders": orders, "vehicles": df_veh, "drivers": drivers_by_wh, "dist": df_dist,
-            "cust": cust, "warehouses": warehouses, "notes": notes}
+if __name__ == "__main__":
+    main()
 
 
 # ============================================================================
