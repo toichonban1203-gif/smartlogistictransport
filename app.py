@@ -184,7 +184,12 @@ def render_input_block(prefix, label, seed_df):
     if mode == INPUT_MODES[0]:
         st.markdown(f"##### ✍️ Nhập trực tiếp danh mục {label}")
         seed_key = f"{prefix}_seed"
-        if seed_key not in st.session_state: st.session_state[seed_key] = seed_df.copy()
+        if seed_key not in st.session_state:
+            st.session_state[seed_key] = seed_df.copy()
+        else:
+            # Tự động bổ sung cột Max_Distance vào session cũ nếu chưa có để hiển thị lên data_editor
+            if prefix == "fleet" and "Max_Distance" not in st.session_state[seed_key].columns:
+                st.session_state[seed_key]["Max_Distance"] = 100.0
         edited = st.data_editor(st.session_state[seed_key], num_rows="dynamic", key=f"{prefix}_editor")
     else:
         st.markdown(f"##### 📂 Upload file {label}")
@@ -255,13 +260,7 @@ def render_result(prefix, title):
     st.caption(f"🧠 RAM kết quả: {mem_kb(res['df']):,.1f} KB (gốc {res.get('ram_before_kb', 0):,.1f} KB)")
     rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
     st.info(f"📁 Thư mục lưu: {rel}")
-    cols = st.columns(len(res["files"]))
-    for c, path in zip(cols, res["files"]):
-        if os.path.exists(path):
-            with open(path, "rb") as fh: data = fh.read()
-            mime = XLSX_MIME if path.endswith(".xlsx") else "application/json"
-            c.download_button(f"⬇️ Tải {os.path.basename(path)}", data, file_name=os.path.basename(path), mime=mime, key=f"{prefix}_dl_{os.path.basename(path)}")
-    return res
+    cols = st.columns(
 
 # ============================================================================
 # 🚚 TAB 1: FLEET (HẠM ĐỘI XE)
