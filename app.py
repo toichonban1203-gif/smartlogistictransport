@@ -875,51 +875,53 @@ def main():
 if __name__ == "__main__":
     main()
 # ============================================================================
-# gán hàm tổng : MASTER LOGISTICS OPTIMIZER (TẢI TRỌNG, XE NHỎ NHẤT, BACKLOG & THỜI GIAN <= 8H)
+# TAB A: RÀNG BUỘC TRỌNG TẢI & HẠM ĐỘI (FLEET & CAPACITY CONSTRAINTS)
 # ============================================================================
-def evaluate_transportation_and_time_constraints(route_or_order, df_vehicles, vehicle_available_counts, outsourcing_config):
+def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_available_counts, outsourcing_config):
     """
-    Hệ thống đánh giá toàn diện:
-    1. Ràng buộc trọng tải & hạm đội (Xe nhỏ nhất, Thuê ngoài Full, Cắt phần dư, Trừ số lượng xe).
-    2. Ràng buộc quãng đường tối đa (Max_Distance từ Tab 1) -> Cắt đơn backlog sang tiết kiệm loại 2.
-    3. Ràng buộc thời gian tuyến (<= 8 giờ) giữ nguyên.
+    Tab A: Chuyên trách kiểm tra trọng tải, hạm đội và quãng đường tối đa (Max_Distance):
+    1. Vượt toàn bộ hạm đội nhà -> Thuê ngoài Full.
+    2. Lớn hơn xe lớn nhất hạm đội -> Cắt full-fill xe lớn nhất (trừ 1 xe), phần dư xét thuê ngoài Tiết kiệm 1 hoặc 2.
+    3. Thỏa hạm đội -> Luôn chọn xe NHỎ NHẤT khả thi (trừ 1 xe trong ngày).
+    4. Kiểm tra Max_Distance -> Cắt đơn backlog sang thuê ngoài tiết kiệm loại 2.
     """
     total_w = float(route_or_order.get("total_weight_kg", 0.0))
     total_v = float(route_or_order.get("total_volume_m3", 0.0))
     total_dist = float(route_or_order.get("total_distance_km", 0.0))
     
+    if df_vehicles.empty:
+        return {
+            "status": "OUTSOURCED", "action_type": "NO_FLEET",
+            "outsourcing_type": "Full Outsourcing", "cost": outsourcing_config.get("full_price", 2500000.0),
+            "message": "⚠️ Hạm đội trống -> Thuê ngoài Full."
+        }
+
     max_fleet_w = df_vehicles["max_weight_kg"].max()
     max_fleet_v = df_vehicles["max_volume_m3"].max()
     sum_fleet_w = df_vehicles["max_weight_kg"].sum()
     sum_fleet_v = df_vehicles["max_volume_m3"].sum()
     
     result = {
-        "status": "APPROVED",
-        "action_type": "IN_HOUSE",
-        "assigned_vehicle": None,
-        "outsourcing_type": None,
-        "cost": 0.0,
-        "message": ""
+        "status": "APPROVED", "action_type": "IN_HOUSE",
+        "assigned_vehicle": None, "outsourcing_type": None, "cost": 0.0, "message": ""
     }
     
-    # BƯỚC 1: Xét vượt toàn bộ hạm đội -> Thuê ngoài Full
+    # 1. Vượt toàn bộ hạm đội
     if total_w > sum_fleet_w or total_v > sum_fleet_v:
         result.update({
-            "status": "OUTSOURCED",
-            "action_type": "OUTSOURCE_FULL",
+            "status": "OUTSOURCED", "action_type": "OUTSOURCE_FULL",
             "outsourcing_type": "Full Outsourcing",
             "cost": outsourcing_config.get("full_price", 2500000.0),
-            "message": "🚨 Vượt quá tổng sức chứa toàn bộ hạm đội nhà -> Thuê ngoài loại Full (tính theo chuyến)."
+            "message": "🚨 Vượt quá tổng sức chứa toàn bộ hạm đội nhà -> Thuê ngoài loại Full theo chuyến."
         })
         return result
 
-    # BƯỚC 2: Lớn hơn xe lớn nhất của hạm đội nhà -> Cắt đơn full-fill xe lớn nhất, phần dư xét thuê ngoài
+    # 2. Vượt xe lớn nhất nhà -> Cắt full-fill xe lớn nhất, phần dư xét thuê ngoài
     if total_w > max_fleet_w or total_v > max_fleet_v:
         largest_idx = df_vehicles["max_weight_kg"].idxmax()
         largest_vehicle = df_vehicles.loc[largest_idx]
-        
-        # Trừ số lượng xe lớn nhất hôm đó đi 1 (nếu còn)
         v_id = largest_vehicle["vehicle_id"]
+        
         if vehicle_available_counts.get(v_id, 0) > 0:
             vehicle_available_counts[v_id] -= 1
         
@@ -938,22 +940,18 @@ def evaluate_transportation_and_time_constraints(route_or_order, df_vehicles, ve
             out_cost = outsourcing_config.get("saving_1_price", 800000.0)
             
         result.update({
-            "status": "PARTIAL_SPLIT",
-            "action_type": "MAX_VEHICLE_PLUS_OUTSOURCE",
-            "assigned_vehicle": v_id,
-            "outsourcing_type": out_type,
-            "cost": out_cost,
+            "status": "PARTIAL_SPLIT", "action_type": "MAX_VEHICLE_PLUS_OUTSOURCE",
+            "assigned_vehicle": v_id, "outsourcing_type": out_type, "cost": out_cost,
             "message": f"⚠️ Vượt xe lớn nhất nhà ({v_id}). Cắt full-fill xe này (trừ 1 xe), phần dư đẩy sang thuê ngoài {out_type}."
         })
         return result
 
-    # BƯỚC 3: Thỏa điều kiện hạm đội -> Luôn chọn xe NHỎ NHẤT trong các xe khả thi
+    # 3. Thỏa hạm đội -> Chọn xe NHỎ NHẤT khả thi
     feasible_vehicles = df_vehicles[
         (df_vehicles["max_weight_kg"] >= total_w) & 
         (df_vehicles["max_volume_m3"] >= total_v)
-    ].sort_values(by="max_weight_kg", ascending=True) # Ưu tiên xe nhỏ nhất
+    ].sort_values(by="max_weight_kg", ascending=True)
     
-    # Kiểm tra xem còn xe khả thi nào còn số lượng trong ngày không
     chosen_vehicle = None
     for _, veh in feasible_vehicles.iterrows():
         if vehicle_available_counts.get(veh["vehicle_id"], 1) > 0:
@@ -961,101 +959,135 @@ def evaluate_transportation_and_time_constraints(route_or_order, df_vehicles, ve
             break
             
     if chosen_vehicle is None:
-        # Đủ điều kiện tải trọng nhưng hết xe nhà khả dụng -> Xét phần dư / thiếu xe chuyển thuê ngoài tiết kiệm 1
         result.update({
-            "status": "OUTSOURCED",
-            "action_type": "OUTSOURCE_NO_VEHICLE_AVAILABLE",
+            "status": "OUTSOURCED", "action_type": "OUTSOURCE_NO_VEHICLE_AVAILABLE",
             "outsourcing_type": "Tiết kiệm loại 1",
             "cost": outsourcing_config.get("saving_1_price", 800000.0),
-            "message": "⚠️ Đủ tải trọng nhưng hạm đội đã hết xe khả dụng trong ngày -> Thuê ngoài tiết kiệm loại 1."
+            "message": "⚠️ Đủ tải trọng nhưng hết xe khả dụng trong ngày -> Thuê ngoài tiết kiệm loại 1."
         })
         return result
     
-    # Trừ 1 số lượng xe nhà vừa được chọn sử dụng
     chosen_v_id = chosen_vehicle["vehicle_id"]
     vehicle_available_counts[chosen_v_id] = vehicle_available_counts.get(chosen_v_id, 1) - 1
     
-    # BƯỚC 4: Kiểm tra ràng buộc quãng đường tối đa (Max_Distance từ Tab 1)
+    # 4. Kiểm tra Max_Distance từ Tab 1
     max_distance_limit = float(chosen_vehicle.get("Max_Distance", 100.0))
     if total_dist > max_distance_limit:
         result.update({
-            "status": "BACKLOG_TRIGGERED",
-            "action_type": "DISTANCE_EXCEEDED_BACKLOG",
-            "assigned_vehicle": chosen_v_id,
-            "outsourcing_type": "Tiết kiệm loại 2 (Phần cắt đơn backlog)",
+            "status": "BACKLOG_TRIGGERED", "action_type": "DISTANCE_EXCEEDED_BACKLOG",
+            "assigned_vehicle": chosen_v_id, "outsourcing_type": "Tiết kiệm loại 2 (Phần cắt đơn backlog)",
             "cost": outsourcing_config.get("saving_2_price", 300000.0),
             "message": f"⚠️ Tuyến vượt quá Max_Distance ({total_dist}km > {max_distance_limit}km) của xe {chosen_v_id}. Cắt đơn backlog sang thuê ngoài tiết kiệm loại 2."
         })
         return result
         
-    # BƯỚC 5: Kiểm tra ràng buộc thời gian tuyến (Giữ nguyên logic <= 8h)
-    service_time_rules = {"B2C": {"loading": 25, "unloading": 35}, "B2B": {"loading": 45, "unloading": 60}}
-    orders_in_route = route_or_order.get("orders", [])
-    vehicle_speed = float(chosen_vehicle.get("average_speed_kmh", 40.0))
-    
-    travel_hours = total_dist / vehicle_speed if vehicle_speed > 0 else 0.0
-    service_mins = sum(service_time_rules.get(o.get("order_type", "B2C"), service_time_rules["B2C"])["loading"] + 
-                       service_time_rules.get(o.get("order_type", "B2C"), service_time_rules["B2C"])["unloading"] 
-                       for o in orders_in_route)
-    total_duration = travel_hours + (service_mins / 60.0)
-    
-    if total_duration > 8.0:
-        result.update({
-            "status": "BACKLOG_TIME_EXCEEDED",
-            "action_type": "TIME_WINDOW_BACKLOG",
-            "assigned_vehicle": chosen_v_id,
-            "outsourcing_type": "Tiết kiệm loại 2 (Vượt 8h)",
-            "cost": outsourcing_config.get("saving_2_price", 300000.0),
-            "message": f"⚠️ Tuyến vượt quá 8 giờ ({total_duration:.2f}h). Đẩy đơn sang backlog / thuê ngoài tiết kiệm loại 2."
-        })
-        return result
-
-    # Thỏa mọi tiêu chuẩn nhà thành công
     result.update({
-        "status": "APPROVED",
-        "action_type": "IN_HOUSE_SUCCESS",
+        "status": "APPROVED", "action_type": "IN_HOUSE_SUCCESS",
         "assigned_vehicle": chosen_v_id,
-        "message": f"✅ Thỏa mãn hoàn toàn! Giao xe NHỎ NHẤT khả thi: {chosen_v_id} (Đã trừ 1 xe trong ngày)."
+        "message": f"✅ Thỏa mãn trọng tải! Giao xe NHỎ NHẤT khả thi: {chosen_v_id} (Đã trừ 1 xe trong ngày)."
     })
     return result
 
 
+# ============================================================================
+# TAB B: RÀNG BUỘC THỜI GIAN TUYẾN (TIME WINDOW & DURATION CONSTRAINTS)
+# ============================================================================
+def evaluate_time_constraints(route_or_order, chosen_vehicle=None, service_time_rules=None):
+    """
+    Tab B: Chuyên trách kiểm tra thời gian thực hiện tuyến giao hàng (<= 8 giờ):
+    - Tính toán thời gian di chuyển dựa trên vận tốc trung bình của xe.
+    - Cộng thời gian bốc/dỡ hàng chuẩn hóa theo loại đơn (B2B / B2C).
+    - Kiểm tra điều kiện giới hạn $\le 8$ giờ và đẩy sang backlog nếu vi phạm.
+    """
+    if service_time_rules is None:
+        service_time_rules = {
+            "B2C": {"loading": 25, "unloading": 35}, 
+            "B2B": {"loading": 45, "unloading": 60}  
+        }
+        
+    orders_in_route = route_or_order.get("orders", [])
+    total_dist = float(route_or_order.get("total_distance_km", 0.0))
+    vehicle_speed = float(chosen_vehicle.get("average_speed_kmh", 40.0) if chosen_vehicle is not None else 40.0)
+    current_date = route_or_order.get("current_date", "2026-04-03")
+    
+    travel_hours = total_dist / vehicle_speed if vehicle_speed > 0 else 0.0
+    service_mins = sum(
+        service_time_rules.get(o.get("order_type", "B2C"), service_time_rules["B2C"])["loading"] + 
+        service_time_rules.get(o.get("order_type", "B2C"), service_time_rules["B2C"])["unloading"] 
+        for o in orders_in_route
+    )
+    total_duration = travel_hours + (service_mins / 60.0)
+    
+    if total_duration <= 8.0:
+        return {
+            "status": "APPROVED", "action_type": "TIME_APPROVED",
+            "total_hours": round(total_duration, 2),
+            "message": f"✅ Đạt yêu cầu thời gian tuyến: {round(total_duration, 2)}h (<= 8h)."
+        }
+    else:
+        backlog_orders = [
+            dict(o, backlog_days_count=o.get("backlog_days_count", 0) + 1, original_date=o.get("original_date", current_date)) 
+            for o in orders_in_route
+        ]
+        return {
+            "status": "BACKLOG_TIME_EXCEEDED", "action_type": "TIME_WINDOW_BACKLOG",
+            "total_hours": round(total_duration, 2),
+            "outsourcing_type": "Tiết kiệm loại 2 (Vượt 8h)",
+            "message": f"⚠️ Tuyến vượt quá 8 giờ ({round(total_duration, 2)}h > 8.0h)! Đẩy đơn sang backlog / thuê ngoài tiết kiệm loại 2.",
+            "backlog_orders_next_day": backlog_orders
+        }
+
+
+# ============================================================================
+# RENDER GIAO DIỆN TÁCH TAB A & TAB B
+# ============================================================================
 def render_routing_constraints_tab():
-    st.header("🗺️ Tab 6: Tối ưu Vận tải & Hạm đội (Clarke-Wright)")
-    st.markdown("Hệ thống xét xe nhỏ nhất, trừ số lượng xe, cắt phần dư theo định mức, kiểm tra `Max_Distance` và kiểm soát thời gian $\le 8$h.")
+    st.header("🗺️ Tối ưu Vận tải & Hạm đội (Clarke-Wright)")
+    st.markdown("Hệ thống tách biệt rõ ràng giữa **Tab A (Trọng tải & Hạm đội)** và **Tab B (Thời gian Tuyến)**.")
     
     with st.expander("⚙️ Cấu hình Chi phí Thuê ngoài Tùy ý", expanded=True):
         col1, col2, col3 = st.columns(3)
         with col1:
             full_p = st.number_input("Giá thuê ngoài Full (VNĐ)", min_value=0.0, value=2500000.0, step=100000.0)
         with col2:
-            s1_p = st.number_input("Giá thuê ngoài Tiết kiệm 1 (VNĐ) [Dư 20-100kg hoặc 1-5m3 / Hết xe]", min_value=0.0, value=800000.0, step=50000.0)
+            s1_p = st.number_input("Giá thuê ngoài Tiết kiệm 1 (VNĐ)", min_value=0.0, value=800000.0, step=50000.0)
         with col3:
-            s2_p = st.number_input("Giá thuê ngoài Tiết kiệm 2 (VNĐ) [Dư <20kg hoặc <1m3 / Backlog Max_Distance / >8h]", min_value=0.0, value=300000.0, step=50000.0)
+            s2_p = st.number_input("Giá thuê ngoài Tiết kiệm 2 (VNĐ)", min_value=0.0, value=300000.0, step=50000.0)
             
     outsourcing_cfg = {"full_price": full_p, "saving_1_price": s1_p, "saving_2_price": s2_p}
     
-    if st.button("🚀 Thực thi Kiểm tra Vận tải Tab 6", key="run_tab6_new_logic", type="primary"):
-        try:
-            fleet_path = os.path.join(BASE_DIR, "output_fleet/DIM_VEHICLE.xlsx")
-            if not os.path.exists(fleet_path):
-                st.error("❌ Chưa tìm thấy file `DIM_VEHICLE.xlsx`. Vui lòng chạy Tab 1 trước!")
-                return
-            df_veh = pd.read_excel(fleet_path)
+    # Tạo 2 tab rành mạch
+    tab_a, tab_b = st.tabs(["📦 Tab A: Trọng tải & Hạm đội", "⏱️ Tab B: Thời gian Tuyến"])
+    
+    fleet_path = os.path.join(BASE_DIR, "output_fleet/DIM_VEHICLE.xlsx")
+    if not os.path.exists(fleet_path):
+        st.warning("⚠️ Chưa tìm thấy file `DIM_VEHICLE.xlsx`. Vui lòng chạy chuẩn hóa ở Tab 1 trước!")
+        return
+        
+    df_veh = pd.read_excel(fleet_path)
+    veh_counts = {row["vehicle_id"]: 2 for _, row in df_veh.iterrows()}
+    
+    sample_route = {
+        "total_weight_kg": 2500.0, 
+        "total_volume_m3": 12.0, 
+        "total_distance_km": 75.0, 
+        "orders": [{"order_type": "B2C"}, {"order_type": "B2B"}]
+    }
+    
+    with tab_a:
+        st.subheader("📦 Kiểm tra Ràng buộc Trọng tải, Hạm đội & Max_Distance")
+        st.markdown("Kiểm tra sức chứa tổng, chiến lược xe nhỏ nhất, trừ số lượng xe trong ngày và giới hạn `Max_Distance`.")
+        if st.button("🚀 Chạy Kiểm tra Tab A", key="run_tab_a", type="primary"):
+            res_a = evaluate_transportation_constraints(sample_route, df_veh.copy(), veh_counts.copy(), outsourcing_cfg)
+            st.success("🏁 Hoàn tất đánh giá Tab A!")
+            st.json(res_a)
             
-            # Khởi tạo giả lập số lượng xe nhà khả dụng trong ngày (mặc định mỗi loại có sẵn 2 chiếc)
-            veh_counts = {row["vehicle_id"]: 2 for _, row in df_veh.iterrows()}
-            
-            # Giả lập dữ liệu tuyến test
-            sample_route = {
-                "total_weight_kg": 2500.0, 
-                "total_volume_m3": 12.0, 
-                "total_distance_km": 85.0,
-                "orders": [{"order_type": "B2C"}, {"order_type": "B2B"}]
-            }
-            
-            res = evaluate_transportation_and_time_constraints(sample_route, df_veh, veh_counts, outsourcing_cfg)
-            st.success("🏁 Kiểm tra ràng buộc thành công!")
-            st.json(res)
-        except Exception as exc:
-            st.error(f"❌ Lỗi thực thi: {exc}")
+    with tab_b:
+        st.subheader("⏱️ Kiểm tra Ràng buộc Thời gian Tuyến ($\le 8$h)")
+        st.markdown("Kiểm tra thời gian di chuyển kết hợp thời gian bốc/dỡ hàng chuẩn hóa cho toàn bộ đơn hàng trong tuyến.")
+        if st.button("🚀 Chạy Kiểm tra Tab B", key="run_tab_b", type="primary"):
+            # Lấy trước xe giả định từ Tab A để test tốc độ
+            dummy_veh = df_veh.iloc[0] if not df_veh.empty else None
+            res_b = evaluate_time_constraints(sample_route, chosen_vehicle=dummy_veh)
+            st.success("🏁 Hoàn tất đánh giá Tab B!")
+            st.json(res_b)
