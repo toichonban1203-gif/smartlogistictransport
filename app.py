@@ -731,7 +731,7 @@ def _full_cls(w, v, oc, why=None):
     else:
         why = f"thuê Full {trips} chuyến xe {fw:,.0f}kg/{fv:g}m³ ({why})"
     return {"type": f"Full — {oc['full_vehicle_name']} × {trips} chuyến", "tier": "FULL", "cost": trips * float(oc["full_price"]),
-            "trips": trips, "vehicle": oc["full_vehicle_name"], "cap_w": trips * fw, "why": why}
+            "trips": trips, "vehicle": oc["full_vehicle_name"], "cap_w": trips * fw, "cap_v": trips * fv, "why": why}
 
 def classify_outsourcing(excess_w, excess_v, oc=None, force_full=False) -> dict:
     oc = {**OC_DEFAULTS, **(oc or {})}
@@ -739,11 +739,11 @@ def classify_outsourcing(excess_w, excess_v, oc=None, force_full=False) -> dict:
     if not force_full:
         if w < oc["tier2_max_w"] and v < oc["tier2_max_v"]:
             return {"type": "Tiết kiệm loại 2", "tier": "SAVING_2", "cost": float(oc["saving_2_price"]), "trips": 1,
-                    "vehicle": "Tiết kiệm loại 2", "cap_w": float(oc["tier2_max_w"]),
+                    "vehicle": "Tiết kiệm loại 2", "cap_w": float(oc["tier2_max_w"]), "cap_v": float(oc["tier2_max_v"]),
                     "why": f"tải {w:.1f}kg < {oc['tier2_max_w']:g}kg và {v:.2f}m³ < {oc['tier2_max_v']:g}m³ nên chọn Tiết kiệm loại 2 (rẻ nhất)"}
         if w <= oc["tier1_max_w"] and v <= oc["tier1_max_v"]:
             return {"type": "Tiết kiệm loại 1", "tier": "SAVING_1", "cost": float(oc["saving_1_price"]), "trips": 1,
-                    "vehicle": "Tiết kiệm loại 1", "cap_w": float(oc["tier1_max_w"]),
+                    "vehicle": "Tiết kiệm loại 1", "cap_w": float(oc["tier1_max_w"]), "cap_v": float(oc["tier1_max_v"]),
                     "why": f"tải {w:.1f}kg ≤ {oc['tier1_max_w']:g}kg và {v:.2f}m³ ≤ {oc['tier1_max_v']:g}m³ (vượt ngưỡng loại 2) nên chọn Tiết kiệm loại 1"}
     return _full_cls(w, v, oc, "bắt buộc thuê Full" if force_full else None)
 
@@ -809,6 +809,7 @@ class Config:
     start_time: str = "08:30"
     max_route_hours: float = 8.0
     detour_factor: float = 1.2
+    constraint_mode: str = "Cube Out (Thể tích m³)"
     service_min: dict = field(default_factory=lambda: {"B2B": 105, "B2C": 60})
     backup_driver_cost: float = 400_000.0
     vehicle_daily_count: int = 2
@@ -1130,6 +1131,16 @@ class RoutePlanner:
             return f"tải {load} vượt tổng sức chứa toàn hạm đội kho {wh_id} ({fleet['max_weight_kg'].sum():,.0f}kg/{fleet['max_volume_m3'].sum():.1f}m³)"
         return f"kho {wh_id} hết xe nhà phù hợp/khả dụng trong ngày (tải {load})"
 
+    def _calculate_load_factor(self, m, vrow, cls):
+        """Tính tỉ lệ lấp đầy linh hoạt theo Cube Out (Thể tích) hoặc Weight Out (Trọng tải)."""
+        mode = getattr(self.cfg, "constraint_mode", "Cube Out (Thể tích m³)")
+        if "Cube Out" in mode:
+            cap_v = float(vrow["max_volume_m3"]) if vrow is not None else float(cls.get("cap_v", 40.0))
+            return min(m["v"] / cap_v, 1.0) if cap_v > 0 else 0.0
+        else:
+            cap_w = float(vrow["max_weight_kg"]) if vrow is not None else float(cls.get("cap_w", 10000.0))
+            return min(m["w"] / cap_w, 1.0) if cap_w > 0 else 0.0
+
     def _outsource_route(self, custs, wh_id, demand, by_cust, cls, events, date_str, km=None, reason=None):
         cfg = self.cfg
         if km is None:
@@ -1141,16 +1152,20 @@ class RoutePlanner:
         if reason is None:
             reason = "; ".join(e.get("why", e["detail"]) for e in events) or "vượt khả năng xe nhà"
         reason = f"{reason} → {cls['why']}"
+        
+        load_factor = self._calculate_load_factor({"w": w, "v": v}, None, cls)
+        
         return {
             "kind": "OUTSOURCE", "id_warehouse": wh_id, "route": list(custs), "orders": [o for c in custs for o in by_cust[c]],
             "vehicle_id": f"3PL-{cls['tier']}", "license_plate": f"Thuê ngoài 3PL ({cls['type']})", "vehicle_type": cls["vehicle"],
             "external": True, "driver_primary": "Đối tác 3PL", "driver_assistant": "—", "is_backup_driver": False,
             "km": round(km, 1), "speed_kmh": cfg.outsourced_speed_kmh,
-            "load_factor": min(max(w / cls["cap_w"] if cls["cap_w"] > 0 else 0.5, 0.15), 1.0),
+            "load_factor": load_factor,
             "fixed_cost": 0.0, "variable_cost": 0.0, "overnight_cost": 0.0, "driver_cost": 0.0,
             "outsourcing_cost": float(cls["cost"]), "outsourcing_type": cls["type"],
             "cut_orders": [], "cut_weight_kg": 0.0, "cut_volume_m3": 0.0,
-            "cap_w": float(cls["cap_w"]), "total_weight_kg": w, "total_volume_m3": v, "reason": reason, "trip_no": None,
+            "cap_w": float(cls["cap_w"]), "cap_v": float(cls.get("cap_v", 40.0)), "total_weight_kg": w, "total_volume_m3": v, 
+            "reason": reason, "trip_no": None,
             "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours, "events": events,
         }
 
@@ -1221,19 +1236,22 @@ class RoutePlanner:
                 orders = [o for c in r for o in by_cust[c]]
                 end_dt = start + dt.timedelta(hours=hours + cfg.turnaround_min / 60.0)
                 veh_free[vid] = f"{end_dt:%H:%M}" if end_dt.date() == start.date() else "23:59"
+                
+                load_factor = self._calculate_load_factor(m, vrow, {})
+                
                 out.append({
                     "kind": "SPLIT" if split else "NORMAL", "id_warehouse": wh_id, "route": list(r), "orders": orders,
                     "vehicle_id": vid, "license_plate": vrow["license_plate"], "vehicle_type": vrow["vehicle_type"], "external": False,
                     "driver_primary": primary, "driver_assistant": assistant, "is_backup_driver": backup,
                     "km": round(m["km"], 1), "speed_kmh": float(vrow["average_speed_kmh"]),
-                    "load_factor": min(max(m["w"] / cap_w if cap_w > 0 else 0.5, 0.15), 1.0),
+                    "load_factor": load_factor,
                     "fixed_cost": float(vrow["fixed_cost"]), "variable_cost": float(vrow["variable_cost"]) * m["km"], "overnight_cost": 0.0,
                     "driver_cost": cfg.backup_driver_cost if backup else 0.0,
                     "outsourcing_cost": float(ta["cost"]) if split else 0.0, "outsourcing_type": ta["outsourcing_type"] if split else None,
                     "cut_orders": [o["order_id"] for o in orders] if split else [],
                     "cut_weight_kg": max(m["w"] - cap_w, 0.0) if split else 0.0,
                     "cut_volume_m3": max(m["v"] - cap_v, 0.0) if split else 0.0,
-                    "cap_w": cap_w, "total_weight_kg": m["w"], "total_volume_m3": m["v"], "reason": reason,
+                    "cap_w": cap_w, "cap_v": cap_v, "total_weight_kg": m["w"], "total_volume_m3": m["v"], "reason": reason,
                     "trip_no": max(1, cfg.vehicle_daily_count - veh_counts.get(vid, 0)),
                     "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours, "events": ev,
                 })
@@ -1500,9 +1518,11 @@ def route_load(r):
 
 def route_vehicle_text(r) -> str:
     if r["external"]:
-        return f"🟣 Thuê ngoài 3PL — {r['vehicle_type']} (Lý do: {r.get('reason') or 'vượt khả năng xe nhà'})"
+        reason_text = r.get('reason') or 'Vượt khả năng xe nhà'
+        return f"🟣 Thuê ngoài 3PL — {r['vehicle_type']} (Lý do: {reason_text})"
     if r["kind"] == "SPLIT":
-        return f"🚚 {r['vehicle_type']} + 3PL {r['outsourcing_type']} (Lý do: {r.get('reason')})"
+        reason_text = r.get('reason') or 'Đơn quá cỡ'
+        return f"🚚 {r['vehicle_type']} + 3PL {r['outsourcing_type']} (Lý do: {reason_text})"
     return "🚚 " + str(r["vehicle_type"])
 
 def day_orders_df(day, planner, tagged) -> pd.DataFrame:
@@ -1532,6 +1552,7 @@ def routes_to_df(tagged_routes, wh_info, cfg: Config) -> pd.DataFrame:
             "ĐƠN GIAO": ", ".join(o["order_id"] for o in r["orders"]), "SỐ ĐƠN": len(r["orders"]),
             "TỔNG TRỌNG TẢI (kg)": round(tw, 1), "TỔNG THỂ TÍCH (m³)": round(tv, 2),
             "TẢI TRỌNG XE (kg)": round(float(r.get("cap_w", 0.0)), 1),
+            "THỂ TÍCH XE (m³)": round(float(r.get("cap_v", 0.0)), 2),
             "TÀI XẾ CHÍNH": r["driver_primary"] + (" ⚠️ dự phòng" if r["is_backup_driver"] else ""),
             "PHỤ XE": r["driver_assistant"], "XE": route_vehicle_text(r),
             "BIỂN SỐ": r["license_plate"], "CHUYẾN": f"{r['trip_no']}/{cfg.vehicle_daily_count}" if r.get("trip_no") else "—",
@@ -1606,28 +1627,39 @@ def build_plan_workbook(plan: dict) -> bytes:
 # ============================================================================
 def render_routing_settings():
     with st.expander("⚙️ Tham số mô hình, thuê ngoài & kho xuất phát", expanded=True):
-        c1, c2, c3 = st.columns(3)
+        c_mode, c1, c2 = st.columns(3)
+        constraint_mode = c_mode.selectbox(
+            "📦 Đặc thù hàng hóa (Lấp đầy theo)", 
+            ["Cube Out (Thể tích m³)", "Weight Out (Trọng tải kg)"],
+            index=0,
+            key="cfg_constraint_mode"
+        )
         start_time = c1.text_input("Giờ xuất phát (HH:MM)", "08:30", key="cfg_start")
         max_hours = c2.number_input("Giới hạn giờ / tuyến", 1.0, 24.0, 8.0, 0.5, key="cfg_maxh")
+        
+        c3, c4, c5 = st.columns(3)
         detour = c3.number_input("Hệ số đường vòng", 1.0, 3.0, 1.2, 0.05, key="cfg_detour")
-        c4, c5, c6 = st.columns(3)
         svc_b2b = c4.number_input("Bốc/dỡ B2B (phút)", 0, 600, 105, 5, key="cfg_b2b")
         svc_b2c = c5.number_input("Bốc/dỡ B2C (phút)", 0, 600, 60, 5, key="cfg_b2c")
+        
+        c6, c7, c8 = st.columns(3)
         backup = c6.number_input("Chi phí tài xế dự phòng (đ)", 0, 10_000_000, 400_000, 50_000, key="cfg_backup")
-        c7, c8, _ = st.columns(3)
         trips = c7.number_input("Số chuyến tối đa / xe / ngày", 1, 5, 2, 1, key="cfg_trips")
         turn = c8.number_input("Thời gian quay đầu giữa 2 chuyến (phút)", 0, 240, 30, 5, key="cfg_turn")
+        
         st.markdown("##### 🚛 Chi phí thuê ngoài (mỗi lần / mỗi chuyến)")
         o1, o2, o3 = st.columns(3)
         full_p = o1.number_input("Thuê ngoài Full (đ / chuyến)", 0.0, 100_000_000.0, 2_500_000.0, 100_000.0, key="cfg_full_p")
         s1_p = o2.number_input("Tiết kiệm loại 1 (đ)", 0.0, 100_000_000.0, 800_000.0, 50_000.0, key="cfg_s1_p")
         s2_p = o3.number_input("Tiết kiệm loại 2 (đ)", 0.0, 100_000_000.0, 300_000.0, 50_000.0, key="cfg_s2_p")
         st.caption("Màn lọc: < 20 kg và < 1 m³ → loại 2 · 20–100 kg / 1–5 m³ → loại 1 · lớn hơn → thuê ngoài Full theo xe bên dưới.")
+        
         st.markdown("##### 🚚 Giao diện cấu hình tham số xe thuê ngoài Full (Full-fill)")
         f1, f2, f3 = st.columns(3)
         fv_name = f1.text_input("Loại xe thuê ngoài", "Xe tải thuê ngoài", key="cfg_fv_name")
         fv_w = f2.number_input("Khối lượng max (kg)", 1.0, 1_000_000.0, 10_000.0, 500.0, key="cfg_fv_w")
         fv_v = f3.number_input("Thể tích max (m³)", 0.1, 10_000.0, 40.0, 1.0, key="cfg_fv_v")
+        
     base_cfg = Config()
     opts = depot_options(base_cfg)
     if st.session_state.get("cfg_depot") not in opts:
@@ -1635,7 +1667,9 @@ def render_routing_settings():
     depot_label = st.selectbox("Kho xuất phát cho Savings S_ij", list(opts), key="cfg_depot")
     try: dt.datetime.strptime(start_time, "%H:%M")
     except ValueError: start_time = "08:30"
+    
     cfg = Config(start_time=start_time, max_route_hours=float(max_hours), detour_factor=float(detour),
+                 constraint_mode=constraint_mode,
                  service_min={"B2B": int(svc_b2b), "B2C": int(svc_b2c)}, backup_driver_cost=float(backup), vehicle_daily_count=int(trips), turnaround_min=float(turn),
                  full_price=float(full_p), saving_1_price=float(s1_p), saving_2_price=float(s2_p),
                  full_vehicle_name=(fv_name or "").strip() or "Xe tải thuê ngoài",
@@ -1671,23 +1705,28 @@ def render_dashboard(plan):
     g = st.columns(5)
     g[0].metric("🎯 Vi phạm giới hạn giờ", kpis["violations"])
     g[1].metric("👑 Tổng chi phí (VNĐ)", money(total_cost))
-    g[2].metric("Lấp đầy TB", f"{kpis['avg_load_factor'] * 100:.1f}%")
+    g[2].metric(f"Lấp đầy TB ({getattr(cfg, 'constraint_mode', 'Cube Out').split()[0]})", f"{kpis['avg_load_factor'] * 100:.1f}%")
     g[3].metric("Tỉ lệ 3PL", f"{kpis['external_ratio'] * 100:.1f}%")
     g[4].metric("Đơn chưa giao", f"{kpis['undelivered_orders']}/{kpis['total_orders']}")
     if not tagged: return st.info("Không có tuyến nào trong ngày.")
-    st.markdown("### 🧩 2. Bảng tuyến đã ghép (kèm tổng trọng tải từng tuyến)")
+    st.markdown("### 🧩 2. Bảng tuyến đã ghép (kèm tổng trọng tải & thể tích từng tuyến)")
     rdf = routes_to_df(tagged, planner.wh, cfg)
     st.dataframe(rdf, hide_index=True)
     w_home = sum(route_load(r)[0] for r, _ in tagged if not r["external"])
     w_3pl = sum(route_load(r)[0] for r, _ in tagged if r["external"])
     st.caption(f"Tổng trọng tải đã ghép: {w_home + w_3pl:,.1f} kg — xe nhà {w_home:,.1f} kg · thuê ngoài 3PL {w_3pl:,.1f} kg.")
+    
     ext = [(i, r) for i, (r, _) in enumerate(tagged, 1) if r["external"] or r["kind"] == "SPLIT"]
     if ext:
         with st.expander(f"🟣 Lý do thuê ngoài 3PL ({len(ext)} tuyến)", expanded=True):
             for i, r in ext:
                 tw, tv = route_load(r)
-                st.markdown(f"**{route_label(i, r, planner.wh)}** — {r['outsourcing_type']} · {tw:,.1f} kg / {tv:.2f} m³ · {money(r['outsourcing_cost'])} đ  \n"
-                            f"↳ Lý do: {r['reason']}")
+                reason_msg = r.get("reason") or "Vượt khả năng đáp ứng của xe nhà"
+                outsourcing_type = r.get("outsourcing_type") or "3PL"
+                outsourcing_cost = r.get("outsourcing_cost", 0)
+                st.markdown(f"**{route_label(i, r, planner.wh)}** — {outsourcing_type} · {tw:,.1f} kg / {tv:.2f} m³ · {money(outsourcing_cost)} đ  \n"
+                            f"↳ Lý do: {reason_msg}")
+                            
     labels = rdf["MÃ TUYẾN"].tolist()
     sel = st.selectbox("🔎 Xem chi tiết thứ tự giao", labels, key=f"t6_route_sel_{date_str}")
     r, _ = tagged[labels.index(sel)]
