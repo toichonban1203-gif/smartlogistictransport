@@ -380,7 +380,6 @@ def render_fleet_tab():
         ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
         store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
     render_result("fleet", "📊 Kết quả Hạm đội")
-
 # ============================================================================
 # 🏭 TAB 2: WAREHOUSE (KHO & TỌA ĐỘ)
 # ============================================================================
@@ -405,6 +404,11 @@ def clean_address(address):
     text = re.sub(r"\s+-\s+", ", ", text)
     text = re.sub(r"[^0-9A-Za-zÀ-ỹĐđ\s,./'-]", " ", text)
     for p, r in ADDRESS_ABBR: text = re.sub(p, r, text, flags=re.IGNORECASE)
+    
+    # Khử mâu thuẫn tên đường & phường (Ví dụ: Tôn Đức Thắng Đống Đa vs Phường Bách Khoa)
+    if re.search(r"Tôn Đức Thắng", text, re.I) and re.search(r"Bách Khoa", text, re.I):
+        text = re.sub(r"Phường Bách Khoa,?\s*", "", text, flags=re.I)
+        
     text = re.sub(r"\s+", " ", text).strip(" ,.")
     if text and not re.search(r"\bViệt Nam\b|\bVietnam\b", text, re.I): text += ", Việt Nam"
     return text
@@ -424,18 +428,27 @@ def get_geocoder():
 @st.cache_resource(show_spinner=False)
 def _geo_cache(): return {}
 
-def geocode_address(address, retries=3):
+def geocode_address(address, ref_wh_lat=21.0285, ref_wh_lng=105.8542, max_valid_km=150.0, retries=3):
     if not address: return {"ok": False, "status": "❌ Địa chỉ trống"}
     cache = _geo_cache()
     if address in cache: return cache[address]
     geocoder = get_geocoder()
     if geocoder is None: return {"ok": False, "status": "❌ Không khởi tạo được ArcGIS"}
+    
     for attempt in range(1, retries + 1):
         try:
             loc = geocoder.geocode(address, timeout=10)
             if loc is None: return {"ok": False, "status": "⚠️ Không tìm thấy địa chỉ"}
             lat, lng = float(loc.latitude), float(loc.longitude)
-            if not coordinate_in_vietnam(lat, lng): return {"ok": False, "status": "⚠️ Tọa độ ngoài VN"}
+            
+            if not coordinate_in_vietnam(lat, lng): 
+                return {"ok": False, "status": "⚠️ Tọa độ ngoài VN"}
+            
+            # Kiểm tra khoảng cách an toàn chống Geocode nhầm địa chỉ ra quá xa (> 150km)
+            dist_to_wh = haversine(ref_wh_lat, ref_wh_lng, lat, lng)
+            if dist_to_wh > max_valid_km:
+                return {"ok": False, "status": f"⚠️ Geocode sai vị trí cách kho {dist_to_wh:.0f}km"}
+
             res = {"ok": True, "lat": lat, "lng": lng, "display_name": getattr(loc, "address", "") or "", "score": 1.0}
             cache[address] = res
             return res
@@ -451,7 +464,9 @@ def process_warehouse(warehouse_id, address, do_geocode=True):
     result = {"id_warehouse": "" if is_blank(warehouse_id) else str(warehouse_id).strip(), "address": cleaned,
               "lat": None, "lng": None, "chất_lượng_địa_chỉ": quality, "trạng_thái_geocode": "—"}
     if is_blank(warehouse_id) or not cleaned or not do_geocode: return result
-    geo = geocode_address(cleaned)
+    
+    # Cho phép geocode Kho (không giới hạn max_valid_km đối với bản thân Kho)
+    geo = geocode_address(cleaned, max_valid_km=10000.0)
     if not geo["ok"]:
         result["trạng_thái_geocode"] = geo["status"]; return result
     result.update({"lat": geo["lat"], "lng": geo["lng"], "trạng_thái_geocode": "✅ Thành công"})
@@ -487,6 +502,7 @@ def render_warehouse_tab():
     res = render_result("wh", "📊 Kết quả Kho")
     if res is not None and not res["df"].dropna(subset=["lat", "lng"]).empty:
         st.map(res["df"].dropna(subset=["lat", "lng"]).rename(columns={"lng": "lon"})[["lat", "lon"]])
+
 
 # ============================================================================
 # 📦 TAB 3: PRODUCT (SẢN PHẨM)
