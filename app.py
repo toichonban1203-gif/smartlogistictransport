@@ -92,7 +92,6 @@ def parse_num(val):
     except Exception: return 0.0
 
 def parse_qty(x, dot_is_decimal=False) -> float:
-    """Xử lý số liệu an toàn tuyệt đối với định dạng tiếng Việt & Anh."""
     if x is None: return 0.0
     if isinstance(x, (int, float, np.integer, np.floating)): 
         return 0.0 if pd.isna(x) else float(x)
@@ -112,7 +111,6 @@ def parse_qty(x, dot_is_decimal=False) -> float:
     except ValueError: return 0.0
 
 def parse_date_iso(dstr: str) -> str:
-    """Quét ngày tháng thông minh hỗ trợ mọi định dạng YYYY-MM-DD / DD/MM/YYYY."""
     if is_blank(dstr): return ""
     dstr = str(dstr).strip()
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y", "%Y.%m.%d", "%d.%m.%Y"):
@@ -586,7 +584,7 @@ def render_driver_tab():
     render_result("driver", "📊 Kết quả Tài xế")
 
 # ============================================================================
-# 🧾 TAB 5: ORDERS (ĐƠN HÀNG)
+# 🧾 TAB 5: ORDERS (ĐƠN HÀNG & GEOCODING)
 # ============================================================================
 _ORDER_RAW = {
     "order_id": dict(aliases=["mã đơn", "order id", "order code"], negative=[]),
@@ -596,7 +594,7 @@ _ORDER_RAW = {
     "items": dict(aliases=["mặt hàng", "items", "product"], negative=[]),
     "total_weight_kg": dict(aliases=["trọng lượng", "weight", "kg"], negative=[]),
     "total_volume_m3": dict(aliases=["thể tích", "volume", "m3"], negative=[]),
-    "address": dict(aliases=["địa chỉ", "address", "destination"], negative=[]),
+    "address": dict(aliases=["địa chỉ", "address", "destination", "location", "vị trí"], negative=[]),
     "order_status": dict(aliases=["trạng thái", "status"], negative=[]),
     "order_type": dict(aliases=["loại đơn", "order type", "channel"], negative=[]),
     "alert_status": dict(aliases=["cảnh báo", "alert", "priority"], negative=[]),
@@ -630,7 +628,7 @@ def orders_semantic_mapping(df):
         result[fld] = (best_col, best_score, "tên cột") if best_score > 0.3 else (None, 0.0, "")
     return result
 
-def process_order(raw, reports):
+def process_order_with_geocode(raw, do_geocode=True):
     r_name = str(raw.get("customer_name", ""))
     cust_name = r_name or "Khách lẻ"
     t_type = "B2C"
@@ -648,6 +646,18 @@ def process_order(raw, reports):
     q = parse_qty(raw.get("quantity"))
     w = parse_qty(raw.get("total_weight_kg"))
     v = parse_qty(raw.get("total_volume_m3"), dot_is_decimal=True)
+    
+    addr = str(raw.get("address", "")).strip()
+    cleaned_addr = clean_address(addr)
+    lat, lng, geo_status = None, None, "— Chưa quét"
+    
+    if do_geocode and cleaned_addr:
+        geo = geocode_address(cleaned_addr)
+        if geo["ok"]:
+            lat, lng, geo_status = geo["lat"], geo["lng"], "✅ Thành công"
+        else:
+            geo_status = geo["status"]
+            
     return {
         "order_id": str(raw.get("order_id", "")),
         "customer_id": str(raw.get("customer_id", "")),
@@ -656,12 +666,14 @@ def process_order(raw, reports):
         "items": str(raw.get("items", "")),
         "total_weight_kg": round(w or 0.0, 4),
         "total_volume_m3": round(v or 0.0, 6),
-        "address": str(raw.get("address", "")),
+        "address": cleaned_addr,
+        "lat": lat,
+        "lng": lng,
+        "trạng_thái_geocode": geo_status,
         "order_status": status,
         "order_type": t_type,
         "alert_status": t_alert,
         "order_date": parse_date_iso(raw.get("order_date")),
-        "ghi_chú": "",
     }
 
 def orders_validate_output(df):
@@ -670,40 +682,41 @@ def orders_validate_output(df):
     for _, row in out.iterrows():
         errs = []
         if is_blank(row.get("order_id")): errs.append("Thiếu id")
-        if is_blank(row.get("address")): errs.append("Thiếu địa chỉ")
+        if is_blank(row.get("address")): errs.append("Thiếu địa chỉ/location")
+        if pd.isna(row.get("lat")) or pd.isna(row.get("lng")): errs.append("Chưa quét được tọa độ")
         msgs.append("❌ " + "; ".join(errs) if errs else "✅ Hợp lệ")
     out["kiểm_tra"] = msgs
     return out
 
 def render_orders_tab():
-    st.header("🧾 Quản lý Đơn hàng (Orders)")
-    mode, edited, uploaded = render_input_block("orders", "đơn hàng", pd.DataFrame({"order_id": ["ORD_001"], "customer_name": ["Nguyễn Văn A"], "address": ["Hà Nội"], "total_weight_kg": [10.5]}))
+    st.header("🧾 Quản lý Đơn hàng & Quét Tọa độ (Orders)")
+    do_geo = st.checkbox("🌍 Tự động quét ArcGIS Geocoding cho Location/Address đơn hàng", value=True, key="ord_do_geo")
+    mode, edited, uploaded = render_input_block("orders", "đơn hàng", pd.DataFrame({"order_id": ["ORD_001"], "customer_name": ["Nguyễn Văn A"], "address": ["Số 1 Tràng Tiền, Hà Nội"], "total_weight_kg": [10.5]}))
     if st.button("🔍 Quét & Mapping", key="orders_scan", type="primary"):
         run_scan("orders", "đơn hàng", mode, uploaded, edited, orders_semantic_mapping)
     raw = st.session_state.get("orders_raw")
     if raw is None: return
     chosen = render_mapping("orders", FIELDS, raw)
-    if st.button("🚀 Chuẩn hóa Đơn hàng", key="orders_process", type="primary"):
+    if st.button("🚀 Chuẩn hóa & Quét Tọa độ Đơn hàng", key="orders_process", type="primary"):
         colmap = build_colmap(raw, chosen)
-        reports, rows = Counter(), []
-        for _, row in raw.iterrows():
-            rows.append(process_order({f: row.get(c) for f, c in colmap.items()}, reports))
+        rows = []
+        with st.spinner("Đang chuẩn hóa & quét ArcGIS Geocoding địa chỉ đơn hàng..."):
+            for _, row in raw.iterrows():
+                rows.append(process_order_with_geocode({f: row.get(c) for f, c in colmap.items()}, do_geocode=do_geo))
         out = orders_validate_output(pd.DataFrame(rows))
         files = save_outputs(OUT_ORDERS, "DIM_ORDERS", "DIM_ORDERS", out)
-        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa đơn hàng", [("Tổng đơn", len(out))])
+        
+        # Đồng bộ tạo luôn DATASET_CUSTOMER cho Tab 6
+        cust_df = out.dropna(subset=["lat", "lng"])[["customer_id", "customer_name", "address", "lat", "lng", "trạng_thái_geocode"]].drop_duplicates(subset=["customer_id"])
+        save_outputs(OUT_CUSTOMER, "DATASET_CUSTOMER", "DATASET_CUSTOMER", cust_df)
+        
+        ok_count = int((out["trạng_thái_geocode"] == "✅ Thành công").sum())
+        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa & quét tọa độ đơn hàng", [("Tổng đơn", len(out)), ("Quét tọa độ OK", f"{ok_count}/{len(out)}")])
     render_result("orders", "📊 Kết quả Đơn hàng")
 
 # ============================================================================
-# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT & RÀNG BUỘC VẬN TẢI
+# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT & RÀNG BUỘC VẬN TẢI (HAVERSINE THỐNG NHẤT)
 # ============================================================================
-SCHEMA_CONTRACT = {
-    "output_fleet/DIM_VEHICLE.xlsx": list(VEHICLE_FIELDS),
-    "output_warehouse/WAREHOUSE_WITH_COORDINATES.xlsx": ["id_warehouse", "address", "lat", "lng"],
-    "output_product/DIM_PRODUCT.xlsx": list(PRODUCT_FIELDS),
-    "output_driver/DIM_DRIVER.xlsx": list(DRIVER_FIELDS),
-    "output_orders/DIM_ORDERS.xlsx": FIELDS,
-}
-
 OC_DEFAULTS = {
     "full_price": 2_500_000.0, "saving_1_price": 800_000.0, "saving_2_price": 300_000.0,
     "full_vehicle_name": "Xe tải thuê ngoài", "full_vehicle_max_weight_kg": 10_000.0, "full_vehicle_max_volume_m3": 40.0,
@@ -712,13 +725,12 @@ OC_DEFAULTS = {
 }
 
 def calculate_effective_max_hours(start_time_str="08:30", max_hours_input=8.0):
-    """Tính thời lượng ca làm việc hiệu dụng đến mốc 17:30 chiều."""
     try:
         sh, sm = map(int, start_time_str.split(":"))
         start_in_hours = sh + sm / 60.0
     except Exception:
         start_in_hours = 8.5
-    cutoff_hours = 17.5  # 17:30
+    cutoff_hours = 17.5
     remaining_hours = max(0.0, cutoff_hours - start_in_hours)
     return min(float(max_hours_input), remaining_hours)
 
@@ -891,6 +903,7 @@ def load_warehouse_coords(cfg: Config) -> dict:
 
 def load_customers(cfg: Config) -> dict:
     out = {}
+    if not os.path.exists(resolve_customer_file(cfg)): return out
     for _, r in read_dim_file(resolve_customer_file(cfg)).iterrows():
         cid = str(r.get("customer_id", "")).strip()
         if cid and cid != "nan" and pd.notna(r.get("lat")) and pd.notna(r.get("lng")):
@@ -918,10 +931,16 @@ def load_orders(cfg: Config, notes: list) -> list:
         d_iso = parse_date_iso(dstr)
         if not (oid and cid and d_iso): skipped += 1; continue
         otype = str(r.get("order_type", "")).strip().upper()
+        
+        # Tải thông tin tọa độ lat/lng từ Tab 5 nếu có
+        lat = float(r["lat"]) if pd.notna(r.get("lat")) else None
+        lng = float(r["lng"]) if pd.notna(r.get("lng")) else None
+        
         orders.append({
             "order_id": oid, "customer_id": cid, "order_type": otype if otype in ("B2B", "B2C") else "B2C",
             "total_weight_kg": parse_qty(r.get("total_weight_kg")), "total_volume_m3": parse_qty(r.get("total_volume_m3"), dot_is_decimal=True),
             "address": "" if is_blank(r.get("address")) else str(r["address"]),
+            "lat": lat, "lng": lng,
             "alert_status": "Normal" if is_blank(r.get("alert_status")) else str(r["alert_status"]),
             "order_status": "" if is_blank(r.get("order_status")) else str(r["order_status"]),
             "order_date": d_iso,
@@ -941,8 +960,8 @@ def load_data(cfg: Config) -> dict:
     warehouses = {w: {"lat": la, "lng": lo, "name": w} for w, (la, lo) in wh_coords.items()}
     orphan = sorted(set(veh["id_warehouse"]) - set(warehouses))
     if orphan: notes.append(f"Xe thuộc kho không có tọa độ: {', '.join(orphan)}.")
-    return {"vehicles": veh, "drivers": load_drivers(cfg), "dist": read_matrix(cfg.matrix_file), "cust": load_customers(cfg),
-            "warehouses": warehouses, "orders": load_orders(cfg, notes), "notes": notes}
+    return {"vehicles": veh, "drivers": load_drivers(cfg), "dist": read_matrix(cfg.matrix_file) if os.path.exists(cfg.matrix_file) else pd.DataFrame(), 
+            "cust": load_customers(cfg), "warehouses": warehouses, "orders": load_orders(cfg, notes), "notes": notes}
 
 _TAB_A_EVENTS = {
     "NO_FLEET": ("HIGH", "KHO KHÔNG CÓ XE", "Bổ sung xe cho kho"),
@@ -950,22 +969,15 @@ _TAB_A_EVENTS = {
     "OUTSOURCE_NO_VEHICLE_AVAILABLE": ("MEDIUM", "HẾT XE TRONG NGÀY", "Bổ sung xe / dời lịch"),
     "MAX_VEHICLE_PLUS_OUTSOURCE": ("CRITICAL", "ĐƠN QUÁ CỠ", "Thuê xe lớn"),
 }
-MISSING_KM = 10_000.0
 
 class RoutePlanner:
     def __init__(self, data: dict, cfg: Config = CFG):
         self.cfg = cfg
         self.veh = data["vehicles"]
         self.drivers = data["drivers"]
-        self.dist_df = data["dist"]
         self.cust = data["cust"]
         self.wh = data["warehouses"]
-        self.missing_dist = 0
-        self._idx = {str(c): k for k, c in enumerate(self.dist_df.index)}
-        self._col = {str(c): k for k, c in enumerate(self.dist_df.columns)}
-        self._mat = (self.dist_df.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-                     if not self.dist_df.empty else np.zeros((0, 0)))
-        self.detour = self._calibrate_detour()
+        self.detour = cfg.detour_factor
         self.max_hours = calculate_effective_max_hours(cfg.start_time, cfg.max_route_hours)
         if self.veh.empty:
             self.catalog = pd.DataFrame(columns=["w", "v", "speed", "fixed", "var", "dist"])
@@ -981,40 +993,19 @@ class RoutePlanner:
         for rec in self.veh.to_dict("records"): self._fleet.setdefault(rec["id_warehouse"], []).append(rec)
         for lst in self._fleet.values(): lst.sort(key=lambda r: (r["max_weight_kg"], r["max_volume_m3"]))
 
-    def _mat_get(self, i, j):
-        a, b = self._idx.get(str(i)), self._col.get(str(j))
-        if a is None or b is None: return None
-        v = self._mat[a, b]
-        return None if np.isnan(v) else float(v)
-
-    def _calibrate_detour(self) -> float:
-        ids = [c for c in self._idx if c in self.cust][:60]
-        ratios = []
-        for k, a in enumerate(ids):
-            for b in ids[k + 1:]:
-                d = self._mat_get(a, b)
-                h = haversine(self.cust[a]["lat"], self.cust[a]["lng"], self.cust[b]["lat"], self.cust[b]["lng"])
-                if d is not None and d > 0 and h > 0.05: ratios.append(d / h)
-        if len(ratios) >= 3: return float(min(max(np.median(ratios), 1.0), 3.0))
-        return float(self.cfg.detour_factor)
-
     def _hav(self, a, b) -> float:
         return haversine(a["lat"], a["lng"], b["lat"], b["lng"]) * self.detour
 
     def d_cc(self, i, j) -> float:
         if i == j: return 0.0
-        d = self._mat_get(i, j)
-        if d is not None: return d
-        if i in self.cust and j in self.cust: return self._hav(self.cust[i], self.cust[j])
-        self.missing_dist += 1
-        return MISSING_KM
+        if i in self.cust and j in self.cust: 
+            return self._hav(self.cust[i], self.cust[j])
+        return 0.0
 
     def d_wc(self, wh_id, c) -> float:
-        d = self._mat_get(wh_id, c)
-        if d is not None: return d
-        if wh_id in self.wh and c in self.cust: return self._hav(self.wh[wh_id], self.cust[c])
-        self.missing_dist += 1
-        return MISSING_KM
+        if wh_id in self.wh and c in self.cust: 
+            return self._hav(self.wh[wh_id], self.cust[c])
+        return 0.0
 
     def nearest_wh(self, c) -> str:
         return min(self.wh, key=lambda w: self.d_wc(w, c))
@@ -1132,7 +1123,6 @@ class RoutePlanner:
         return f"kho {wh_id} hết xe nhà phù hợp/khả dụng trong ngày (tải {load})"
 
     def _calculate_load_factor(self, m, vrow, cls):
-        """Tính tỉ lệ lấp đầy linh hoạt theo Cube Out (Thể tích) hoặc Weight Out (Trọng tải)."""
         mode = getattr(self.cfg, "constraint_mode", "Cube Out (Thể tích m³)")
         if "Cube Out" in mode:
             cap_v = float(vrow["max_volume_m3"]) if vrow is not None else float(cls.get("cap_v", 40.0))
@@ -1186,6 +1176,7 @@ class RoutePlanner:
             vrow = fleet[fleet["vehicle_id"] == vid].iloc[0] if (vid and ta["status"] != "OUTSOURCED") else None
             start_str = veh_free.get(vid, cfg.start_time) if vrow is not None else cfg.start_time
             max_h = calculate_effective_max_hours(start_str, cfg.max_route_hours)
+            
             if action == "DISTANCE_EXCEEDED_CUT":
                 bad = ("VƯỢT MAX_DISTANCE", ta["message"], f"tuyến {m['km']:.1f}km > Max_Distance {ta['max_distance_limit']:.0f}km của xe {vid}")
             elif vrow is not None:
@@ -1258,23 +1249,39 @@ class RoutePlanner:
         if cut:
             ids = [c for c, _, _, _ in cut]
             cls = classify_outsourcing(sum(demand[c]["weight"] for c in ids), sum(demand[c]["volume"] for c in ids), oc)
-            ev = [{"sev": "HIGH", "kind": kind, "detail": f"Khách {c}: {detail}", "why": f"khách {c} bị cắt khỏi tuyến xe nhà vì {short}",
-                   "handled": f"Cắt khỏi tuyến → thuê ngoài {cls['type']}", "propose": "Xem lại Max_Distance / số xe", "ids": [c]}
+            
+            cut_details = []
+            for c, kind, detail, short in cut:
+                orders_c = by_cust.get(c, [])
+                order_ids_str = ", ".join(o["order_id"] for o in orders_c) if orders_c else c
+                addr_str = orders_c[0].get("address", "") if orders_c else ""
+                cut_details.append(f"đơn {order_ids_str} ({addr_str}) bị cắt do {short}")
+
+            reason_cut_str = "; ".join(cut_details)
+            ev = [{"sev": "HIGH", "kind": kind, "detail": f"Đơn khách {c}: {detail}", "why": f"đơn {c} bị cắt do {short}",
+                   "handled": f"Cắt khỏi tuyến → thuê ngoài {cls['type']}", "propose": "Bổ sung tọa độ hoặc kiểm tra Max_Distance xe", "ids": [c]}
                   for c, kind, detail, short in cut]
-            out.append(self._outsource_route(ids, wh_id, demand, by_cust, cls, ev, date_str))
+            out.append(self._outsource_route(ids, wh_id, demand, by_cust, cls, ev, date_str, reason=reason_cut_str))
         return out
 
     def plan_day(self, date_str: str, day_orders: list) -> dict:
         cfg, oc = self.cfg, self.cfg.outsourcing
-        res = {"routes": [], "overdue_routes": [], "exceptions": [], "day_cost": 0.0, "orders": list(day_orders)}
+        res = {"routes": [], "overdue_routes": [], "unrouted_orders": [], "exceptions": [], "day_cost": 0.0, "orders": list(day_orders)}
         def log(r):
             for e in r.pop("events"):
                 for o in r["orders"]:
                     if e.get("ids") is None or o["customer_id"] in e["ids"]:
                         res["exceptions"].append({"NGÀY": date_str, "MỨC ĐỘ": e["sev"], "MÃ ĐƠN": o["order_id"], "PHÂN LOẠI": e["kind"],
                                                   "CHI TIẾT": e["detail"], "ĐÃ XỬ LÝ": e["handled"], "ĐỀ XUẤT": e["propose"]})
-        placed = [o for o in day_orders if o["customer_id"] in self.cust]
-        unplaced = [o for o in day_orders if o["customer_id"] not in self.cust]
+                                                  
+        # PHÂN LOẠI: Đơn có lat/lng hợp lệ MỚI ĐƯỢC Routing, đơn thiếu lat/lng bị từ chối Routing
+        placed = [o for o in day_orders if o.get("lat") is not None and o.get("lng") is not None]
+        unplaced = [o for o in day_orders if o.get("lat") is None or o.get("lng") is None]
+        
+        # Cập nhật danh sách cust tĩnh từ danh sách đơn có tọa độ thực tế
+        for o in placed:
+            self.cust[o["customer_id"]] = {"lat": float(o["lat"]), "lng": float(o["lng"]), "name": o["customer_id"]}
+        
         veh_counts = {vid: cfg.vehicle_daily_count for vid in self.veh["vehicle_id"]}
         veh_free = {}
         driver_pointers = {w: {"c": 0, "p": 0} for w in self.wh}
@@ -1287,6 +1294,7 @@ class RoutePlanner:
             assistant = p_list[idx_p % len(p_list)] if p_list else "Phụ xe"
             driver_pointers[wh_id]["p"] += 1
             return primary, assistant, backup
+            
         by_wh = {}
         for o in placed: by_wh.setdefault(self.nearest_wh(o["customer_id"]), []).append(o)
         for wh_id, ords in by_wh.items():
@@ -1296,16 +1304,9 @@ class RoutePlanner:
             for rt in routes:
                 for r in self._dispatch(rt, wh_id, demand, by_cust, veh_counts, assign_driver, date_str, veh_free):
                     log(r); res["routes"].append(r)
-        if unplaced:
-            wh0 = next(iter(self.wh))
-            demand, by_cust = self._demand(unplaced)
-            for c in demand:
-                cls = classify_outsourcing(demand[c]["weight"], demand[c]["volume"], oc)
-                ev = [{"sev": "MEDIUM", "kind": "THIẾU TỌA ĐỘ", "detail": "Không tìm thấy khách hàng trong DATASET_CUSTOMER",
-                       "why": "khách hàng thiếu tọa độ nên không thể ghép tuyến",
-                       "handled": f"Thuê ngoài {cls['type']} (không thể định tuyến)", "propose": "Bổ sung tọa độ"}]
-                r = self._outsource_route([c], wh0, demand, by_cust, cls, ev, date_str, km=0.0)
-                log(r); res["routes"].append(r)
+                    
+        # Đơn chưa quét được tọa độ -> Lưu vào danh sách bị từ chối
+        res["unrouted_orders"] = unplaced
         res["day_cost"] = sum(route_total(r) for r in res["routes"])
         return res
 
@@ -1319,12 +1320,16 @@ def simulate_all(data: dict, cfg: Config = CFG):
     delivered = {o["order_id"] for r in all_r for o in r["orders"]}
     n_routes = len(all_r)
     operating = sum(d["day_cost"] for d in days.values())
+    
+    unrouted_count = sum(len(d["unrouted_orders"]) for d in days.values())
+    
     kpis = {
         "violations": sum(1 for r in inhouse if r["hours"] > cfg.max_route_hours + 1e-9),
         "operating_cost": operating,
         "external_ratio": sum(r["external"] for r in all_r) / n_routes if n_routes else 0,
         "avg_load_factor": sum(r["load_factor"] for r in inhouse) / len(inhouse) if inhouse else 0,
         "undelivered_orders": len(data["orders"]) - len(delivered),
+        "unrouted_orders": unrouted_count,
         "total_orders": len(data["orders"]),
     }
     return planner, days, kpis, operating
@@ -1341,9 +1346,7 @@ def file_status(cfg: Config) -> pd.DataFrame:
         ("Tab 2 · Kho & Tọa độ", cfg.warehouse_file, "Khuyến nghị"),
         ("Tab 3 · Sản phẩm", cfg.product_file, "Tuỳ chọn"),
         ("Tab 4 · Tài xế", cfg.driver_file, "Bắt buộc"),
-        ("Tab 5 · Đơn hàng", cfg.order_file, "Bắt buộc"),
-        ("Bước 1 · Khách hàng + tọa độ", cfg.cust_file, "Bắt buộc"),
-        ("Bước 2 · Ma trận khoảng cách", cfg.matrix_file, "Bắt buộc"),
+        ("Tab 5 · Đơn hàng (Đã geocode)", cfg.order_file, "Bắt buộc"),
     ]
     rows = [{"Nguồn": n, "File": os.path.relpath(p, BASE_DIR), "Trạng thái": "✅ Có" if os.path.exists(p) else "❌ Chưa có", "Yêu cầu": need}
             for n, p, need in items]
@@ -1354,97 +1357,9 @@ def require_files(cfg: Config, which):
         "orders": (cfg.order_file, "Tab 5 (Đơn hàng)"),
         "fleet": (cfg.vehicle_file, "Tab 1 (Hạm đội xe)"),
         "driver": (cfg.driver_file, "Tab 4 (Tài xế)"),
-        "matrix": (cfg.matrix_file, "Bước 2 (Ma trận khoảng cách)"),
     }
     missing = [f"`{os.path.relpath(labels[k][0], BASE_DIR)}` (chạy {labels[k][1]})" for k in which if not os.path.exists(labels[k][0])]
     if missing: raise UserError("Thiếu file đầu vào: " + "; ".join(missing))
-
-def step_geocode_customers(cfg: Config, on_progress=None) -> dict:
-    require_files(cfg, ["orders"])
-    df_orders = pd.read_excel(cfg.order_file)
-    if "customer_id" not in df_orders.columns:
-        raise UserError("DIM_ORDERS.xlsx không có cột customer_id.")
-    cols = [c for c in ["customer_id", "customer_name", "address"] if c in df_orders.columns]
-    df_cust = df_orders[cols].dropna(subset=["customer_id"]).copy()
-    df_cust["customer_id"] = df_cust["customer_id"].astype(str).str.strip()
-    df_cust = df_cust[df_cust["customer_id"] != ""].drop_duplicates(subset=["customer_id"]).reset_index(drop=True)
-    if df_cust.empty:
-        raise UserError("Không có khách hàng hợp lệ trong DIM_ORDERS.xlsx.")
-    geolocator = ArcGIS(user_agent="smart_logistics_customer_geocoder/1.0", timeout=15)
-    geocode = RateLimiter(geolocator.geocode, min_delay_seconds=0.5, swallow_exceptions=True)
-    cache, lat_list, lng_list, matched_list, status_list = {}, [], [], [], []
-    total = len(df_cust)
-    for k, (_, row) in enumerate(df_cust.iterrows(), 1):
-        addr = str(row.get("address", "")).strip()
-        if not addr or addr.lower() == "nan":
-            lat_list.append(None); lng_list.append(None); matched_list.append(""); status_list.append("❌ Địa chỉ trống")
-        else:
-            if addr in cache:
-                lat, lng, matched_address, status = cache[addr]
-            else:
-                query = addr if "việt nam" in addr.lower() else f"{addr}, Việt Nam"
-                try:
-                    loc = geocode(query)
-                    if loc:
-                        lat, lng, matched_address = float(loc.latitude), float(loc.longitude), str(loc.address)
-                        status = "✅ Geocode hợp lệ" if (8.0 <= lat <= 24.5 and 102.0 <= lng <= 110.0) else "❌ Tọa độ ngoài Việt Nam"
-                    else:
-                        lat, lng, matched_address, status = None, None, "", "⚠️ Không tìm thấy địa chỉ"
-                except Exception as exc:
-                    lat, lng, matched_address, status = None, None, "", f"❌ Lỗi: {exc}"
-                cache[addr] = (lat, lng, matched_address, status)
-            lat_list.append(lat); lng_list.append(lng); matched_list.append(matched_address); status_list.append(status)
-        if on_progress: on_progress(k, total)
-    df_cust["lat"], df_cust["lng"] = lat_list, lng_list
-    df_cust["matched_address"], df_cust["trạng_thái_geocode"] = matched_list, status_list
-    files = save_outputs(OUT_CUSTOMER, "DATASET_CUSTOMER", "DATASET_CUSTOMER", df_cust)
-    success = int((df_cust["trạng_thái_geocode"] == "✅ Geocode hợp lệ").sum())
-    return {"df": df_cust, "files": files, "success": success, "failed": total - success}
-
-def build_distance_matrices(df_valid: pd.DataFrame, detour: float = 1.2):
-    cust_ids = df_valid["customer_id"].tolist()
-    coords_str = ";".join(f"{row['lng']},{row['lat']}" for _, row in df_valid.iterrows())
-    url = f"http://router.project-osrm.org/table/v1/driving/{coords_str}?annotations=distance,duration"
-    note = ""
-    try:
-        response = requests.get(url, timeout=20)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("code") == "Ok":
-                dist = pd.DataFrame([[d / 1000.0 for d in row] for row in data.get("distances")], index=cust_ids, columns=cust_ids)
-                dur = pd.DataFrame([[t / 60.0 for t in row] for row in data.get("durations")], index=cust_ids, columns=cust_ids)
-                return dist, dur, "OSRM (đường bộ thực tế)", ""
-            note = f"OSRM mã lỗi: {data.get('code')}"
-        else:
-            note = f"HTTP Error Status: {response.status_code}"
-    except Exception as exc:
-        note = f"Không gọi được OSRM API ({exc})"
-    n = len(cust_ids)
-    lat, lng = df_valid["lat"].astype(float).tolist(), df_valid["lng"].astype(float).tolist()
-    dist_matrix, dur_matrix = np.zeros((n, n)), np.zeros((n, n))
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                d = haversine(lat[i], lng[i], lat[j], lng[j]) * detour
-                dist_matrix[i][j] = round(d, 2)
-                dur_matrix[i][j] = round(d / 40.0 * 60.0, 2)
-    return (pd.DataFrame(dist_matrix, index=cust_ids, columns=cust_ids),
-            pd.DataFrame(dur_matrix, index=cust_ids, columns=cust_ids),
-            f"Haversine × {detour} (dự phòng)", note)
-
-def step_distance_matrix(cfg: Config) -> dict:
-    df_cust = pd.read_excel(resolve_customer_file(cfg))
-    df_cust["customer_id"] = df_cust["customer_id"].astype(str).str.strip()
-    df_valid = df_cust.dropna(subset=["lat", "lng"]).drop_duplicates(subset=["customer_id"]).reset_index(drop=True)
-    if len(df_valid) < 2:
-        raise UserError("Cần ít nhất 2 khách hàng có tọa độ Lat/Lon để tính ma trận!")
-    dist, dur, method, note = build_distance_matrices(df_valid, cfg.detour_factor)
-    os.makedirs(OUT_MATRIX, exist_ok=True)
-    dist_path, dur_path, json_path = os.path.join(OUT_MATRIX, "DISTANCE_MATRIX_KM.xlsx"), os.path.join(OUT_MATRIX, "DURATION_MATRIX_MIN.xlsx"), os.path.join(OUT_MATRIX, "OSRM_MATRIX_RESULT.json")
-    dist.to_excel(dist_path); dur.to_excel(dur_path)
-    with open(json_path, "w", encoding="utf-8") as fh:
-        json.dump({"customers": df_valid["customer_id"].tolist(), "distance_matrix_km": dist.to_dict(), "duration_matrix_min": dur.to_dict()}, fh, ensure_ascii=False, indent=2)
-    return {"dist": dist, "dur": dur, "method": method, "note": note, "files": [dist_path, dur_path, json_path], "n": len(df_valid), "skipped": len(df_cust) - len(df_valid)}
 
 def depot_options(cfg: Config) -> dict:
     opts = {"Mặc định Hà Nội (21.0285, 105.8542)": (21.0285, 105.8542)}
@@ -1452,55 +1367,11 @@ def depot_options(cfg: Config) -> dict:
         opts[f"Kho {wid} ({la:.4f}, {lo:.4f})"] = (la, lo)
     return opts
 
-def step_savings(cfg: Config, depot) -> dict:
-    require_files(cfg, ["matrix"])
-    df_dist = read_matrix(cfg.matrix_file)
-    depot_lat, depot_lng = depot
-    wid = next((w for w, (la, lo) in load_warehouse_coords(cfg).items() if abs(la - depot_lat) < 1e-4 and abs(lo - depot_lng) < 1e-4), "DEPOT_CHON")
-    planner = RoutePlanner({"vehicles": pd.DataFrame(columns=["vehicle_id", "id_warehouse"]), "drivers": {}, "dist": df_dist,
-                            "cust": load_customers(cfg), "warehouses": {wid: {"lat": depot_lat, "lng": depot_lng, "name": wid}}}, cfg)
-    customers = [c for c in df_dist.index.tolist() if c in planner.cust]
-    rows = []
-    for s_ij, ci, cj in planner.savings_list(customers, wid):
-        rows.append({"Cặp khách hàng": f"{ci} - {cj}", "Khách hàng 1": ci, "Khách hàng 2": cj, "Mức tiết kiệm (km)": round(s_ij, 2),
-                     "Kho -> Khách 1 (c0i)": round(planner.d_wc(wid, ci), 2), "Kho -> Khách 2 (c0j)": round(planner.d_wc(wid, cj), 2),
-                     "Khách 1 <-> Khách 2 (cij)": round(planner.d_cc(ci, cj), 2), "Kho xuất phát": wid})
-    df_savings = pd.DataFrame(rows)
-    os.makedirs(OUT_MATRIX, exist_ok=True)
-    out_path = os.path.join(OUT_MATRIX, "DATASET_SORT_SAVING.xlsx")
-    df_savings.to_excel(out_path, index=False, sheet_name="SORT_SAVING")
-    return {"df": df_savings, "files": [out_path], "pairs": len(df_savings)}
-
-def step_screening(cfg: Config) -> dict:
-    require_files(cfg, ["orders", "fleet", "matrix"])
-    df_veh, wh = load_vehicles(cfg), load_warehouse_coords(cfg)
-    cust = load_customers(cfg) if os.path.exists(cfg.cust_file) else {}
-    rows = []
-    for _, r in read_dim_file(cfg.order_file).iterrows():
-        w, v, cid = parse_qty(r.get("total_weight_kg")), parse_qty(r.get("total_volume_m3"), dot_is_decimal=True), str(r.get("customer_id", "")).strip()
-        wid, dist = "", 0.0
-        if wh and cid in cust:
-            wid = min(wh, key=lambda k: haversine(wh[k][0], wh[k][1], cust[cid]["lat"], cust[cid]["lng"]))
-            dist = 2 * haversine(wh[wid][0], wh[wid][1], cust[cid]["lat"], cust[cid]["lng"]) * cfg.detour_factor
-        fleet = df_veh[df_veh["id_warehouse"] == wid] if wid else df_veh
-        counts = {vid: cfg.vehicle_daily_count for vid in fleet["vehicle_id"]}
-        ev = evaluate_transportation_constraints({"total_weight_kg": w, "total_volume_m3": v, "total_distance_km": dist}, fleet, counts, cfg.outsourcing)
-        rows.append({"order_id": r.get("order_id"), "customer_id": cid, "id_warehouse": wid, "total_weight_kg": w, "total_volume_m3": v,
-                     "khoảng_cách_km": round(dist, 1), "status": ev["status"], "action_type": ev["action_type"],
-                     "assigned_vehicle": ev.get("assigned_vehicle"), "outsourcing_type": ev.get("outsourcing_type"),
-                     "cost": ev.get("cost", 0.0), "số_chuyến_thuê_ngoài": (ev.get("cls") or {}).get("trips"), "message": ev["message"]})
-    df = pd.DataFrame(rows)
-    return {"df": df, "files": save_outputs(OUT_SCREEN, "DATASET_SCREENING", "DATASET_SCREENING", df)}
-
 def step_clarke_wright(cfg: Config) -> dict:
-    require_files(cfg, ["orders", "fleet", "driver", "matrix"])
+    require_files(cfg, ["orders", "fleet", "driver"])
     data = load_data(cfg)
     planner, days, kpis, total_cost = simulate_all(data, cfg)
     notes = list(data["notes"])
-    if planner.missing_dist:
-        notes.append(f"Có {planner.missing_dist} lượt tra khoảng cách bị thiếu dữ liệu → gán khoảng cách phạt {MISSING_KM:,.0f} km.")
-    if abs(planner.detour - cfg.detour_factor) > 0.01:
-        notes.append(f"Hệ số đường vòng được hiệu chỉnh từ ma trận thực tế: ×{planner.detour:.2f} (nhập: ×{cfg.detour_factor:.2f}).")
     return {"planner": planner, "days": days, "kpis": kpis, "total_cost": total_cost, "notes": notes, "cfg": cfg, "n_orders": len(data["orders"])}
 
 # ============================================================================
@@ -1530,14 +1401,16 @@ def day_orders_df(day, planner, tagged) -> pd.DataFrame:
     for idx, (r, _) in enumerate(tagged, 1):
         how = "🟣 3PL" if r["external"] else ("🟠 Xe nhà + 3PL" if r["kind"] == "SPLIT" else "🚚 Xe nhà")
         for o in r["orders"]: where[o["order_id"]] = (route_label(idx, r, planner.wh), how, r["id_warehouse"])
+        
     orders = day.get("orders") or [o for r, _ in tagged for o in r["orders"]]
     rows = []
     for k, o in enumerate(orders, 1):
         c = planner.cust.get(o["customer_id"], {})
-        label, how, wid = where.get(o["order_id"], ("—", "—", "—"))
-        rows.append({"STT": k, "MÃ ĐƠN": o["order_id"], "MÃ KHÁCH": o["customer_id"], "TÊN KHÁCH": c.get("name", ""),
+        label, how, wid = where.get(o["order_id"], ("🟣 Chưa quét được tọa độ", "🔴 Từ chối Routing", "—"))
+        rows.append({"STT": k, "MÃ ĐƠN": o["order_id"], "MÃ KHÁCH": o["customer_id"], "TÊN KHÁCH": c.get("name", o["customer_id"]),
                      "LOẠI ĐƠN": o["order_type"], "TRỌNG LƯỢNG (kg)": o["total_weight_kg"], "THỂ TÍCH (m³)": o["total_volume_m3"],
-                     "ĐỊA CHỈ": o["address"], "NGÀY GIAO": o["order_date"], "TRẠNG THÁI ĐƠN": o["order_status"],
+                     "ĐỊA CHỈ / LOCATION": o["address"], "LAT": o.get("lat"), "LNG": o.get("lng"),
+                     "NGÀY GIAO": o["order_date"], "TRẠNG THÁI ĐƠN": o["order_status"],
                      "CẢNH BÁO": o["alert_status"], "KHO PHỤ TRÁCH": wid, "TUYẾN ĐƯỢC GHÉP": label, "HÌNH THỨC GIAO": how})
     return pd.DataFrame(rows)
 
@@ -1569,10 +1442,10 @@ def route_orders_df(r, cust) -> pd.DataFrame:
     for k, o in enumerate(r["orders"], 1):
         c = cust.get(o["customer_id"], {})
         cum += o["total_weight_kg"]
-        rows.append({"THỨ TỰ": k, "MÃ ĐƠN": o["order_id"], "MÃ KHÁCH": o["customer_id"], "TÊN KHÁCH": c.get("name", ""), "LOẠI ĐƠN": o["order_type"],
+        rows.append({"THỨ TỰ": k, "MÃ ĐƠN": o["order_id"], "MÃ KHÁCH": o["customer_id"], "TÊN KHÁCH": c.get("name", o["customer_id"]), "LOẠI ĐƠN": o["order_type"],
                      "TRỌNG LƯỢNG (kg)": o["total_weight_kg"], "THỂ TÍCH (m3)": o["total_volume_m3"],
-                     "TRỌNG LƯỢNG LŨY KẾ (kg)": round(cum, 1), "ĐỊA CHỈ": o["address"],
-                     "lat": c.get("lat"), "lon": c.get("lng")})
+                     "TRỌNG LƯỢNG LŨY KẾ (kg)": round(cum, 1), "ĐỊA CHỈ / LOCATION": o["address"],
+                     "lat": o.get("lat"), "lon": o.get("lng")})
     return pd.DataFrame(rows)
 
 def service_rules_from_cfg(cfg: Config) -> dict:
@@ -1611,6 +1484,7 @@ def build_plan_workbook(plan: dict) -> bytes:
         {"Chỉ số": "Tỉ lệ thuê ngoài 3PL", "Giá trị": kpis["external_ratio"]},
         {"Chỉ số": "Lấp đầy trung bình", "Giá trị": kpis["avg_load_factor"]},
         {"Chỉ số": "Đơn chưa giao", "Giá trị": kpis["undelivered_orders"]},
+        {"Chỉ số": "Đơn chưa quét được tọa độ (Từ chối Routing)", "Giá trị": kpis["unrouted_orders"]},
         {"Chỉ số": "Tổng số đơn", "Giá trị": kpis["total_orders"]},
     ])
     buf = io.BytesIO()
@@ -1638,7 +1512,7 @@ def render_routing_settings():
         max_hours = c2.number_input("Giới hạn giờ / tuyến", 1.0, 24.0, 8.0, 0.5, key="cfg_maxh")
         
         c3, c4, c5 = st.columns(3)
-        detour = c3.number_input("Hệ số đường vòng", 1.0, 3.0, 1.2, 0.05, key="cfg_detour")
+        detour = c3.number_input("Hệ số đường vòng (Haversine)", 1.0, 3.0, 1.2, 0.05, key="cfg_detour")
         svc_b2b = c4.number_input("Bốc/dỡ B2B (phút)", 0, 600, 105, 5, key="cfg_b2b")
         svc_b2c = c5.number_input("Bốc/dỡ B2C (phút)", 0, 600, 60, 5, key="cfg_b2c")
         
@@ -1664,7 +1538,7 @@ def render_routing_settings():
     opts = depot_options(base_cfg)
     if st.session_state.get("cfg_depot") not in opts:
         st.session_state["cfg_depot"] = list(opts)[0]
-    depot_label = st.selectbox("Kho xuất phát cho Savings S_ij", list(opts), key="cfg_depot")
+    depot_label = st.selectbox("Kho xuất phát cho Clarke-Wright", list(opts), key="cfg_depot")
     try: dt.datetime.strptime(start_time, "%H:%M")
     except ValueError: start_time = "08:30"
     
@@ -1700,7 +1574,7 @@ def render_dashboard(plan):
     s[0].metric("Số đơn trong ngày", len(ddf))
     s[1].metric("Tổng trọng lượng (kg)", f"{ddf['TRỌNG LƯỢNG (kg)'].sum():,.1f}" if not ddf.empty else "0")
     s[2].metric("Tổng thể tích (m³)", f"{ddf['THỂ TÍCH (m³)'].sum():,.2f}" if not ddf.empty else "0")
-    s[3].metric("Số khách hàng", int(ddf["MÃ KHÁCH"].nunique()) if not ddf.empty else 0)
+    s[3].metric("Đơn chưa quét tọa độ (Từ chối Routing)", len(day.get("unrouted_orders", [])))
     st.dataframe(ddf, hide_index=True)
     g = st.columns(5)
     g[0].metric("🎯 Vi phạm giới hạn giờ", kpis["violations"])
@@ -1708,7 +1582,8 @@ def render_dashboard(plan):
     g[2].metric(f"Lấp đầy TB ({getattr(cfg, 'constraint_mode', 'Cube Out').split()[0]})", f"{kpis['avg_load_factor'] * 100:.1f}%")
     g[3].metric("Tỉ lệ 3PL", f"{kpis['external_ratio'] * 100:.1f}%")
     g[4].metric("Đơn chưa giao", f"{kpis['undelivered_orders']}/{kpis['total_orders']}")
-    if not tagged: return st.info("Không có tuyến nào trong ngày.")
+    
+    if not tagged: return st.info("Không có tuyến hợp lệ nào trong ngày.")
     st.markdown("### 🧩 2. Bảng tuyến đã ghép (kèm tổng trọng tải & thể tích từng tuyến)")
     rdf = routes_to_df(tagged, planner.wh, cfg)
     st.dataframe(rdf, hide_index=True)
@@ -1732,7 +1607,7 @@ def render_dashboard(plan):
     r, _ = tagged[labels.index(sel)]
     odf = route_orders_df(r, planner.cust)
     tw, tv = route_load(r)
-    st.caption(f"Tổng trọng tải tuyến: {tw:,.1f} kg / {tv:.2f} m³ · Tải trọng xe: {float(r.get('cap_w', 0)):,.0f} kg · Quãng đường: {r['km']} km · Thời gian: {r['hours']:.2f} h")
+    st.caption(f"Tổng trọng tải tuyến: {tw:,.1f} kg / {tv:.2f} m³ · Tải trọng xe: {float(r.get('cap_w', 0)):,.0f} kg · Quãng đường Haversine: {r['km']} km · Thời gian: {r['hours']:.2f} h")
     left, right = st.columns([3, 2])
     with left: st.dataframe(odf.drop(columns=["lat", "lon"]), hide_index=True)
     with right:
@@ -1744,31 +1619,19 @@ def render_dashboard(plan):
     st.download_button("⬇️ Tải kế hoạch tuyến (Excel)", plan["xlsx"], file_name="ROUTE_PLAN.xlsx", mime=XLSX_MIME, key="t6_dl_plan")
 
 def render_routing_tab():
-    st.header("🗺️ Dashboard Định tuyến — Clarke-Wright Savings")
+    st.header("🗺️ Dashboard Định tuyến — Clarke-Wright (Haversine Đồng bộ)")
     cfg, depot = render_routing_settings()
     st.markdown("### 📂 Trạng thái dữ liệu đầu vào")
     st.dataframe(file_status(cfg), hide_index=True)
-    if st.button("⚡ Chạy toàn bộ pipeline (bước 1 → 5)", type="primary", key="t6_runall"):
-        steps = [
-            ("geo", "Bước 1 · Geocode khách hàng", lambda: step_geocode_customers(cfg)),
-            ("matrix", "Bước 2 · Ma trận khoảng cách", lambda: step_distance_matrix(cfg)),
-            ("savings", "Bước 3 · Tính Savings S_ij", lambda: step_savings(cfg, depot)),
-            ("screen", "Bước 4 · Sàng lọc tải trọng", lambda: step_screening(cfg)),
-            ("plan", "Bước 5 · Clarke-Wright toàn cục", lambda: step_clarke_wright(cfg)),
-        ]
-        with st.status("Đang chạy pipeline định tuyến...", expanded=True) as status:
-            for name, label, fn in steps:
-                try: st.session_state[f"t6_{name}"] = fn()
-                except Exception as exc:
-                    status.update(label=f"❌ Lỗi ở: {label}", state="error")
-                    st.error(f"❌ {exc}"); break
-            else: status.update(label="✅ Hoàn tất pipeline", state="complete")
+    if st.button("⚡ Chạy thuật toán Clarke-Wright Routing", type="primary", key="t6_runall"):
+        with st.status("Đang chạy thuật toán định tuyến Clarke-Wright...", expanded=True) as status:
+            try:
+                st.session_state["t6_plan"] = step_clarke_wright(cfg)
+                status.update(label="✅ Hoàn tất định tuyến!", state="complete")
+            except Exception as exc:
+                status.update(label="❌ Lỗi trong quá trình định tuyến", state="error")
+                st.error(f"❌ {exc}")
     st.divider()
-    if st.button("▶️ Chạy bước 1 (Geocode)", key="t6_b1"): exec_step("geo", lambda: step_geocode_customers(cfg))
-    if st.button("▶️ Chạy bước 2 (Ma trận)", key="t6_b2"): exec_step("matrix", lambda: step_distance_matrix(cfg))
-    if st.button("▶️ Chạy bước 3 (Savings)", key="t6_b3"): exec_step("savings", lambda: step_savings(cfg, depot))
-    if st.button("▶️ Chạy bước 4 (Sàng lọc)", key="t6_b4"): exec_step("screen", lambda: step_screening(cfg))
-    if st.button("▶️ Chạy bước 5 (Clarke-Wright)", key="t6_b5", type="primary"): exec_step("plan", lambda: step_clarke_wright(cfg))
     plan = st.session_state.get("t6_plan")
     if plan: render_dashboard(plan)
 
@@ -1791,7 +1654,7 @@ def main():
         if st.button("🧹 Giải phóng RAM & Cache", key="free_ram"):
             st.cache_data.clear()
             for k in list(st.session_state):
-                if k.endswith(("_raw", "_result", "_meta", "_why", "_auto_table")):
+                if k.endswith(("_raw", "_result", "_meta", "_why", "_auto_table", "_plan")):
                     st.session_state.pop(k, None)
             st.rerun()
     tabs = st.tabs(TAB_NAMES)
