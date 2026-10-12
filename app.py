@@ -1934,7 +1934,7 @@ INCIDENT_SOLVERS = {
 }
 
 def render_incident_tab():
-    st.header("🚨 7. TRUNG TÂM ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ (39 PYTHON SOLVERS)")
+    st.header("🚨 7. TRUNG TÂM ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ")
     st.caption("🌐 *Liên kết trực tiếp với dữ liệu Đơn hàng (Tab 5), Hạm đội xe (Tab 1) & Tài xế (Tab 4)*")
     
     # Lấy danh sách Order/Vehicle/Driver động từ dữ liệu đã upload ở các Tab
@@ -1959,7 +1959,7 @@ def render_incident_tab():
     # SUB-TAB 1: 39 PYTHON SOLVERS
     # ------------------------------------------------------------------------
     with col_solver:
-        st.markdown("### ⚡ Kích Hoạt Tự Động 39 Solvers Giải Quyết Sự Cố Thực Địa")
+        st.markdown("### ⚡ Kích Hoạt Tự Động Giải Quyết Sự Cố Thực Địa")
         c1, c2 = st.columns([1.2, 2])
         
         with c1:
@@ -1977,7 +1977,7 @@ def render_incident_tab():
                 key="t7_sel_inc"
             )
             
-            btn_run_solver = st.button("🚀 Run Python Solver Tự Động", type="primary", key="btn_run_solver")
+            btn_run_solver = st.button("🚀 Run Tự Động", type="primary", key="btn_run_solver")
             
         with c2:
             st.markdown("##### 🖥️ Màn Hình Log Tự Động Thực Thi (Execution Console)")
@@ -2059,11 +2059,11 @@ TAB_NAMES = [
     "👨‍✈️ 4. Driver",
     "🧾 5. Orders",
     "🗺️ 6. Routing",
-    "🚨 7. Xử Lý Sự Cố (Solvers)"
+    "🚨 7. Xử Lý Sự Cố"
 ]
 
 def main():
-    st.title("🚚 Smart Logistics — Dashboard Chuẩn hóa & Điều phối Vận tải")
+    st.title("🚚 Smart Logistics — Dashboard Chuẩn hóa & Điều phối Vận tải (của Phạm Minh Thái)")
     with st.sidebar:
         st.markdown("### ℹ️ Menu Điều hướng")
         if st.button("🧹 Giải phóng RAM & Cache", key="free_ram"):
