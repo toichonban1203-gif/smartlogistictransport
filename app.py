@@ -720,7 +720,7 @@ def render_orders_tab():
     render_result("orders", "📊 Kết quả Đơn hàng")
 
 # ============================================================================
-# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT & DYNAMIC DRIVER & 3PL FULL
+# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT (NGƯỠNG CẮT <=150% & DYNAMIC 3PL COUNT)
 # ============================================================================
 OC_DEFAULTS = {
     "saving_1_price": 800_000.0, "saving_2_price": 300_000.0,
@@ -780,9 +780,12 @@ def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_ava
     sum_fleet_w, sum_fleet_v = df_vehicles["max_weight_kg"].sum(), df_vehicles["max_volume_m3"].sum()
     avail = df_vehicles[df_vehicles["vehicle_id"].map(lambda x: vehicle_available_counts.get(x, 1) > 0)]
     
-    if total_w > sum_fleet_w or total_v > sum_fleet_v:
-        return outsourced("OUTSOURCE_FULL", _full_cls(total_w, total_v, oc, "bắt buộc khi tải vượt tổng sức chứa hạm đội nhà"),
-                        "🚨 Vượt quá tổng sức chứa hạm đội nhà -> Thuê ngoài 3PL Full.")
+    # 🚨 ĐIỀU KIỆN MỚI 1: Nếu tổng tải vượt quá 150% xe lớn nhất công ty -> THUÊ NGOÀI FULL NGAY LẬP TỨC (KHÔNG CẮT)
+    if total_w > 1.5 * max_fleet_w or total_v > 1.5 * max_fleet_v or total_w > sum_fleet_w or total_v > sum_fleet_v:
+        return outsourced("OUTSOURCE_FULL", _full_cls(total_w, total_v, oc, f"hàng quá khủng vượt 150% xe lớn nhất nhà ({max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³)"),
+                        f"🚨 Hàng quá khủng (vượt >150% xe lớn nhất nhà {max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³) -> Thuê ngoài 3PL Full ngay lập tức.")
+
+    # Nếu tải nằm trong khoảng 100% đến 150% xe lớn nhất -> Mới tiến hành Cắt xe nhà + Thuê ngoài phần dư
     if total_w > max_fleet_w or total_v > max_fleet_v:
         if avail.empty:
             return outsourced("OUTSOURCE_NO_VEHICLE_AVAILABLE", classify_outsourcing(total_w, total_v, oc),
@@ -793,7 +796,7 @@ def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_ava
         cls = classify_outsourcing(total_w - big["max_weight_kg"], total_v - big["max_volume_m3"], oc)
         return {"status": "PARTIAL_SPLIT", "action_type": "MAX_VEHICLE_PLUS_OUTSOURCE", "assigned_vehicle": v_id,
                 "outsourcing_type": cls["type"], "cost": cls["cost"], "cls": cls,
-                "message": f"⚠️ Vượt xe lớn nhất nhà ({v_id}). Cắt xe này, phần dư thuê ngoài {cls['type']}."}
+                "message": f"⚠️ Vượt xe lớn nhất nhà nhưng <= 150% ({v_id}). Cắt xe này, phần dư thuê ngoài {cls['type']}."}
                 
     feasible = avail[(avail["max_weight_kg"] >= total_w) & (avail["max_volume_m3"] >= total_v)] \
         .sort_values(by=["max_weight_kg", "max_volume_m3"], ascending=True)
@@ -1146,7 +1149,7 @@ class RoutePlanner:
         load = f"{m['w']:,.0f}kg/{m['v']:.1f}m³ ({m['qty']} units)"
         if action == "NO_FLEET": return f"kho {wh_id} không có xe nhà (tải {load})"
         if action == "OUTSOURCE_FULL":
-            return f"tải {load} vượt tổng sức chứa hạm đội nhà ({fleet['max_weight_kg'].sum():,.0f}kg/{fleet['max_volume_m3'].sum():.1f}m³)"
+            return f"tải {load} vượt quá 150% xe lớn nhất nhà"
         return f"kho {wh_id} hết xe nhà phù hợp trong ngày (tải {load})"
 
     def _calculate_load_factor(self, m, vrow, cls):
@@ -1567,26 +1570,17 @@ def render_routing_tab():
             
             c1, c2, c3, c4, c5 = st.columns([1.5, 2.5, 1.5, 1.5, 1.5])
             
-            # 1. Bằng tối thiểu xe cần
             req_lic = c1.selectbox(f"Bằng tối thiểu xe #{idx}", LICENSE_LIST, index=LICENSE_LIST.index(suggested_lic), key=f"req_lic_{v_id}_{idx}")
-            
-            # 2. Chọn tên tài xế
             sel_driver = c2.selectbox(f"Tên tài xế xe #{idx}", driver_names, index=0, key=f"drv_name_{v_id}_{idx}")
             
-            # Tìm thông tin tài xế trong DB (nếu có)
             d_info = next((d for d in driver_db if d["driver_name"] == sel_driver), None)
             
             def_lic = d_info["license_type"] if d_info else "B2"
             def_wh = d_info["id_warehouse"] if d_info else v_wh
             def_role = d_info["role"] if d_info else "Tài xế chính"
             
-            # 3. Loại bằng tài xế
             d_lic = c3.selectbox(f"Bằng của tài xế #{idx}", LICENSE_LIST, index=LICENSE_LIST.index(def_lic), key=f"drv_lic_{v_id}_{idx}")
-            
-            # 4. Kho của tài xế
             d_wh = c4.selectbox(f"Kho của tài xế #{idx}", warehouse_list, index=warehouse_list.index(def_wh) if def_wh in warehouse_list else 0, key=f"drv_wh_{v_id}_{idx}")
-            
-            # 5. Vai trò
             d_role = c5.selectbox(f"Vai trò #{idx}", role_list, index=0 if "chính" in norm_basic(def_role) else 1, key=f"drv_role_{v_id}_{idx}")
             
             # 🛡️ KIỂM TRA ĐIỀU KIỆN
@@ -1594,12 +1588,10 @@ def render_routing_tab():
                 req_rank = LICENSE_RANKS.get(req_lic, 6)
                 drv_rank = LICENSE_RANKS.get(d_lic, 6)
                 
-                # Kiểm tra 1: Bằng lái
                 if drv_rank < req_rank:
                     st.error(f"🔴 **Lỗi Bằng Lái:** Tài xế `{sel_driver}` bằng `{d_lic}` KHÔNG ĐỦ điều kiện lái xe `{v_id}` (Yêu cầu tối thiểu bằng `{req_lic}`).")
                     has_driver_error = True
                 
-                # Kiểm tra 2: Kho công tác
                 if d_wh != v_wh:
                     st.error(f"🔴 **Lỗi Kho Công Tác:** Xe `{v_id}` ở `{v_wh}` nhưng tài xế `{sel_driver}` thuộc `{d_wh}`.")
                     has_driver_error = True
@@ -1609,7 +1601,6 @@ def render_routing_tab():
             assignments.append({"vehicle_id": v_id, "driver_name": sel_driver, "req_lic": req_lic, "drv_lic": d_lic, "drv_wh": d_wh, "drv_role": d_role})
             st.divider()
 
-        # Kiểm tra trùng lặp 1 tài xế phân cho nhiều xe
         assigned_names = [a["driver_name"] for a in assignments if a["driver_name"] not in ("-- Chọn Tài xế --", "Thuê dự phòng (Thuê ngoài)")]
         if len(assigned_names) != len(set(assigned_names)):
             dup = set([x for x in assigned_names if assigned_names.count(x) > 1])
@@ -1622,7 +1613,6 @@ def render_routing_tab():
     st.divider()
     st.markdown("## 🚛 3. NHẬP LIỆU ĐỘI XE THUÊ NGOÀI (3PL FULL & TÁCH CHUYẾN)")
     
-    # Lấy danh sách các chuyến cần 3PL Full (Bao gồm cả Chuyến Thuần 3PL và Chuyến Tách/Ghép)
     full_3pl_routes = [r for r, _ in tagged if r["external"] and "FULL" in str(r.get("vehicle_id", "")).upper() or r["kind"] == "SPLIT"]
     
     user_3pl_inputs = []
@@ -1636,16 +1626,35 @@ def render_routing_tab():
             is_split = r["kind"] == "SPLIT"
             tag_type = "Tách chuyến xe nhà + 3PL" if is_split else "Thuần Thuê ngoài 3PL Full"
             
+            # Gợi ý mặc định số lượng xe dựa trên trọng tải / thể tích
+            default_count = max(1, math.ceil(req_w / 10000.0), math.ceil(req_v / 40.0))
+            
             st.markdown(f"##### 📌 Chuyến 3PL Full #{idx} (`{tag_type}`) — Yêu cầu tối thiểu: **Min {req_w:,.1f} kg** | **Min {req_v:.2f} m³**")
             st.caption(f"↳ Gồm {len(r['orders'])} đơn: {', '.join(o['order_id'] for o in r['orders'])}")
             
-            i1, i2, i3, i4 = st.columns(4)
-            v_name = i1.text_input(f"Tên xe 3PL #{idx}", f"Xe tải 3PL #{idx}", key=f"3pl_name_{idx}")
-            v_w = i2.number_input(f"Trọng tải xe (kg) #{idx}", value=float(math.ceil(req_w)), step=100.0, key=f"3pl_w_{idx}")
-            v_v = i3.number_input(f"Thể tích xe (m³) #{idx}", value=float(round(req_v + 0.5, 1)), step=0.5, key=f"3pl_v_{idx}")
-            v_cost = i4.number_input(f"Chi phí thuê xe (đ) #{idx}", value=2_500_000.0, step=100_000.0, key=f"3pl_cost_{idx}")
+            # 🚨 ĐIỀU KIỆN MỚI 2: Thêm ô (+ -) Dropdown / Number Input chọn Số lượng xe 3PL
+            i0, i1, i2, i3, i4 = st.columns([1.2, 2.0, 1.5, 1.5, 1.8])
             
-            user_3pl_inputs.append({"req_w": req_w, "req_v": req_v, "name": v_name, "cap_w": v_w, "cap_v": v_v, "cost": v_cost, "route": r})
+            v_count = i0.number_input(f"Số lượng xe 3PL #{idx}", min_value=1, max_value=20, value=default_count, step=1, key=f"3pl_count_{idx}")
+            v_name = i1.text_input(f"Tên xe 3PL #{idx}", f"Xe tải 3PL #{idx}", key=f"3pl_name_{idx}")
+            
+            # Tải trọng và thể tích của từng 1 xe
+            single_w = float(math.ceil(req_w / v_count))
+            single_v = float(round(req_v / v_count + 0.2, 1))
+            
+            v_w = i2.number_input(f"Tải trọng / 1 xe (kg) #{idx}", value=single_w, step=100.0, key=f"3pl_w_{idx}")
+            v_v = i3.number_input(f"Thể tích / 1 xe (m³) #{idx}", value=single_v, step=0.5, key=f"3pl_v_{idx}")
+            v_cost = i4.number_input(f"Tổng chi phí thuê {v_count} xe (đ) #{idx}", value=2_500_000.0 * v_count, step=100_000.0, key=f"3pl_cost_{idx}")
+            
+            # Tổng sức chứa = Số lượng xe x Sức chứa 1 xe
+            total_cap_w = v_w * v_count
+            total_cap_v = v_v * v_count
+            
+            user_3pl_inputs.append({
+                "req_w": req_w, "req_v": req_v, "count": v_count, "name": f"{v_name} (x{v_count} xe)",
+                "single_w": v_w, "single_v": v_v, "cap_w": total_cap_w, "cap_v": total_cap_v,
+                "cost": v_cost, "route": r
+            })
             st.divider()
 
     # ------------------------------------------------------------------------
@@ -1656,12 +1665,12 @@ def render_routing_tab():
             st.error("❌ Vui lòng sửa lại các lỗi phân công tài xế bị báo đỏ phía trên trước khi tính chi phí cuối cùng!")
             return
             
-        # Kiểm tra tải trọng xe 3PL
+        # Kiểm tra tổng tải trọng đội xe 3PL đã chọn
         valid_3pl = True
         for idx, item in enumerate(user_3pl_inputs, 1):
             if item["cap_w"] < item["req_w"] - 1e-5 or item["cap_v"] < item["req_v"] - 1e-5:
-                st.error(f"❌ Xe 3PL #{idx} (`{item['name']}`) không đủ năng lực! "
-                         f"Cần tối thiểu {item['req_w']:,.1f}kg / {item['req_v']:.2f}m³, nhưng bạn nhập {item['cap_w']:,.1f}kg / {item['cap_v']:.2f}m³.")
+                st.error(f"❌ Đội xe 3PL #{idx} (`{item['name']}`) không đủ năng lực! "
+                         f"Cần tối thiểu {item['req_w']:,.1f}kg / {item['req_v']:.2f}m³, nhưng tổng {item['count']} xe bạn nhập chỉ được {item['cap_w']:,.1f}kg / {item['cap_v']:.2f}m³.")
                 valid_3pl = False
         
         if not valid_3pl: return
@@ -1682,7 +1691,7 @@ def render_routing_tab():
                         r["is_backup_driver"] = True
                         r["driver_cost"] = cfg.backup_driver_cost
 
-        # Cập nhật Xe 3PL Full
+        # Cập nhật thông tin đội xe 3PL Full
         for item in user_3pl_inputs:
             r = item["route"]
             r["vehicle_type"] = item["name"]
@@ -1695,7 +1704,6 @@ def render_routing_tab():
         # Tính toán lại Chi phí Ngày & Load Factor
         day["day_cost"] = sum(route_total(rt) for rt in day["routes"])
         
-        # Tính Tỉ lệ Lấp đầy chỉ cho Xe nhà + Xe 3PL Full (Bỏ qua hoàn toàn Giao Hàng Tiết Kiệm)
         all_day_routes = day["routes"] + day["overdue_routes"]
         valid_load_routes = [rt for rt in all_day_routes if (not rt["external"]) or ("FULL" in str(rt.get("vehicle_id", "")).upper())]
         avg_load_day = (sum(rt["load_factor"] for rt in valid_load_routes) / len(valid_load_routes)) if valid_load_routes else 0.0
@@ -1718,7 +1726,6 @@ def render_routing_tab():
         final_day = final_plan["days"][date_str]
         final_tagged = tag_routes(final_day)
         
-        # Chỉ lấy xe nhà & 3PL Full để tính lấp đầy
         valid_load_routes = [r for r, _ in final_tagged if (not r["external"]) or ("FULL" in str(r.get("vehicle_id", "")).upper())]
         avg_load = (sum(r["load_factor"] for r in valid_load_routes) / len(valid_load_routes) * 100) if valid_load_routes else 0.0
         
