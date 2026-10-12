@@ -37,7 +37,6 @@ OUT_ORDERS = os.path.join(BASE_DIR, "output_orders")
 OUT_CUSTOMER = os.path.join(BASE_DIR, "output_customer")
 OUT_MATRIX = os.path.join(BASE_DIR, "output_matrix")
 
-# Thứ bậc hạng bằng lái chuẩn hóa (Thấp đến Cao)
 LICENSE_RANKS = {
     "A1": 1, "A2": 2, "A3": 3, "A4": 4,
     "B1": 5, "B2": 6,
@@ -585,7 +584,7 @@ def driver_validate_output(df):
 
 def render_driver_tab():
     st.header("👨‍✈️ Quản lý Tài xế (Driver)")
-    mode, edited, uploaded = render_input_block("driver", "tài xế", pd.DataFrame({"driver_id": ["DRV_01"], "driver_name": ["Nguyễn Văn A"], "license_type": ["FC"], "id_warehouse": ["WH_HN_01"], "phone": ["0901234567"]}))
+    mode, edited, uploaded = render_input_block("driver", "tài xế", pd.DataFrame({"driver_id": ["DRV_01"], "driver_name": ["Nguyễn Văn A"], "license_type": ["FC"], "id_warehouse": ["WH_HN_01"], "phone": ["0901234567"], "role": ["Tài xế chính"]}))
     if st.button("🔍 Quét & Mapping", key="driver_scan", type="primary"):
         run_scan("driver", "tài xế", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, DRIVER_FIELDS, lambda s, f: 0.8, 0.35))
     raw = st.session_state.get("driver_raw")
@@ -720,7 +719,7 @@ def render_orders_tab():
     render_result("orders", "📊 Kết quả Đơn hàng")
 
 # ============================================================================
-# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT (DYNAMIC 3PL ADD ROWS & DIM_DRIVER SYNC)
+# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT
 # ============================================================================
 OC_DEFAULTS = {
     "saving_1_price": 800_000.0, "saving_2_price": 300_000.0,
@@ -780,12 +779,11 @@ def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_ava
     sum_fleet_w, sum_fleet_v = df_vehicles["max_weight_kg"].sum(), df_vehicles["max_volume_m3"].sum()
     avail = df_vehicles[df_vehicles["vehicle_id"].map(lambda x: vehicle_available_counts.get(x, 1) > 0)]
     
-    # 🚨 ĐIỀU KIỆN 1: Nếu tổng tải vượt quá 150% xe lớn nhất công ty -> THUÊ NGOÀI FULL NGAY LẬP TỨC (KHÔNG CẮT)
+    # 🚨 Nếu tổng tải vượt quá 150% xe lớn nhất công ty -> THUÊ NGOÀI FULL NGAY LẬP TỨC
     if total_w > 1.5 * max_fleet_w or total_v > 1.5 * max_fleet_v or total_w > sum_fleet_w or total_v > sum_fleet_v:
         return outsourced("OUTSOURCE_FULL", _full_cls(total_w, total_v, oc, f"hàng quá khủng vượt 150% xe lớn nhất nhà ({max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³)"),
                         f"🚨 Hàng quá khủng (vượt >150% xe lớn nhất nhà {max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³) -> Thuê ngoài 3PL Full ngay lập tức.")
 
-    # Nếu tải nằm trong khoảng 100% đến 150% xe lớn nhất -> Mới tiến hành Cắt xe nhà + Thuê ngoài phần dư
     if total_w > max_fleet_w or total_v > max_fleet_v:
         if avail.empty:
             return outsourced("OUTSOURCE_NO_VEHICLE_AVAILABLE", classify_outsourcing(total_w, total_v, oc),
@@ -921,19 +919,38 @@ def load_customers(cfg: Config) -> dict:
             out[cid] = {"lat": float(r["lat"]), "lng": float(r["lng"]), "name": "" if is_blank(r.get("customer_name")) else str(r["customer_name"])}
     return out
 
+# 🚨 CHUẨN HÓA LẤY DỮ LIỆU TÀI XẾ TỪ FILE HOẶC DỰ PHÒNG TỪ SESSION STATE (TAB 4)
 def load_drivers_raw(cfg: Config) -> list:
-    if not os.path.exists(cfg.driver_file): return []
-    df = read_dim_file(cfg.driver_file)
     drivers = []
-    for _, r in df.iterrows():
-        did = str(r.get("driver_id", "")).strip()
-        dname = str(r.get("driver_name", "")).strip()
-        if not did or not dname: continue
-        lic = str(r.get("license_type", "C")).strip().upper()
-        lic = lic if lic in LICENSE_RANKS else "C"
-        wid = str(r.get("id_warehouse", "")).strip()
-        role = str(r.get("role", "Tài xế chính")).strip()
-        drivers.append({"driver_id": did, "driver_name": dname, "license_type": lic, "id_warehouse": wid, "role": role})
+    # Nguồn 1: Đọc từ file DIM_DRIVER.xlsx nếu đã lưu
+    if os.path.exists(cfg.driver_file):
+        try:
+            df = read_dim_file(cfg.driver_file)
+            for _, r in df.iterrows():
+                did = str(r.get("driver_id", "")).strip()
+                dname = str(r.get("driver_name", "")).strip()
+                if not did or not dname or did in ("nan", "None"): continue
+                lic = str(r.get("license_type", "C")).strip().upper()
+                lic = lic if lic in LICENSE_RANKS else "C"
+                wid = str(r.get("id_warehouse", "")).strip()
+                role = str(r.get("role", "Tài xế chính")).strip()
+                drivers.append({"driver_id": did, "driver_name": dname, "license_type": lic, "id_warehouse": wid, "role": role})
+            if drivers: return drivers
+        except Exception: pass
+
+    # Nguồn 2: Nếu chưa có file, lấy từ Tab Driver (Session State)
+    raw_state = st.session_state.get("driver_raw")
+    if raw_state is not None and len(raw_state) > 0:
+        for _, r in raw_state.iterrows():
+            did = str(r.get("driver_id", "")).strip()
+            dname = str(r.get("driver_name", "")).strip()
+            if not did or not dname or did in ("nan", "None"): continue
+            lic = str(r.get("license_type", "C")).strip().upper()
+            lic = lic if lic in LICENSE_RANKS else "C"
+            wid = str(r.get("id_warehouse", "")).strip()
+            role = str(r.get("role", "Tài xế chính")).strip()
+            drivers.append({"driver_id": did, "driver_name": dname, "license_type": lic, "id_warehouse": wid, "role": role})
+            
     return drivers
 
 def load_drivers(cfg: Config) -> dict:
@@ -1346,7 +1363,6 @@ def simulate_all(data: dict, cfg: Config = CFG):
     days = {d: planner.plan_day(d, by_date[d]) for d in sorted(by_date)}
     all_r = [r for d in days.values() for r in d["routes"] + d["overdue_routes"]]
     
-    # CHỈ TÍNH LẤP ĐẦY CHO XE NHÀ & 3PL FULL
     valid_routes_for_load = [r for r in all_r if (not r["external"]) or ("FULL" in str(r.get("vehicle_id", "")).upper())]
     avg_load_factor = (sum(r["load_factor"] for r in valid_routes_for_load) / len(valid_routes_for_load)) if valid_routes_for_load else 0.0
 
@@ -1494,7 +1510,7 @@ def render_routing_settings():
     return cfg, opts[depot_label]
 
 def render_routing_tab():
-    st.header("🗺️ Dashboard Định tuyến — Clarke-Wright (Cắt theo Units & Dynamic Driver & 3PL)")
+    st.header("🗺️ Dashboard Định tuyến — Clarke-Wright")
     cfg, depot = render_routing_settings()
     st.markdown("### 📂 Trạng thái dữ liệu đầu vào")
     st.dataframe(file_status(cfg), hide_index=True)
@@ -1518,13 +1534,12 @@ def render_routing_tab():
     tagged = tag_routes(day)
     
     # ------------------------------------------------------------------------
-    # 📊 BƯỚC 1: BẢNG KẾT QUẢ ROUTING TẠM THỜI (TỐI GIẢN)
+    # 📊 BƯỚC 1: BẢNG ROUTING TẠM THỜI
     # ------------------------------------------------------------------------
     st.divider()
     st.markdown(f"## 📊 1. BẢNG ROUTING TẠM THỜI — {date_str}")
     
     routed_orders_count = sum(len(r["orders"]) for r, _ in tagged)
-    
     g = st.columns(2)
     g[0].metric("Tổng số tuyến được phân", len(tagged))
     g[1].metric("Tổng số đơn đã phân tuyến", routed_orders_count)
@@ -1534,7 +1549,7 @@ def render_routing_tab():
     st.dataframe(rdf_temp[cols_to_show], hide_index=True)
     
     # ------------------------------------------------------------------------
-    # 👨‍✈️ BƯỚC 2: PHÂN CÔNG TÀI XẾ (QUÉT TRỰC TIẾP TỪ DIM_DRIVER & THUÊ DỰ PHÒNG)
+    # 👨‍✈️ BƯỚC 2: BẢNG PHÂN CÔNG TÀI XẾ CHUẨN 4 CỘT
     # ------------------------------------------------------------------------
     st.divider()
     st.markdown("## 👨‍✈️ 2. PHÂN CÔNG TÀI XẾ CHO CÁC XE NHÀ HOẠT ĐỘNG TRONG NGÀY")
@@ -1547,7 +1562,7 @@ def render_routing_tab():
     else:
         st.markdown("Vui lòng phân công tài xế từ bảng `DIM_DRIVER` bên dưới. Mỗi tài xế chỉ lái 1 xe/ngày.")
         
-        # 🚨 ĐIỀU KIỆN 2: Lấy danh sách tên tài xế quét trực tiếp từ bảng DIM_DRIVER + Option Thuê Dự Phòng
+        # Lấy danh sách tài xế chuẩn xác từ load_drivers_raw
         driver_db = data.get("drivers_raw", [])
         driver_options = ["-- Chọn Tài xế --", "Tài xế dự phòng (Thuê ngoài)"] + [d["driver_name"] for d in driver_db]
         
@@ -1563,14 +1578,28 @@ def render_routing_tab():
             
             st.markdown(f"##### 🚚 Xe #{idx}: `{v_id}` (Kho: **{v_wh}** | Tải trọng: **{v_cap_w:,.0f} kg**)")
             
-            c1, c2 = st.columns([2, 3])
+            # 🚨 BẢNG 2 CHUẨN ĐỦ 4 CỘT CẬU YÊU CẦU
+            c1, c2, c3, c4 = st.columns([1.5, 3, 1.5, 2])
             
+            # 1. Bằng tối thiểu cho xe đó
             req_lic = c1.selectbox(f"Bằng tối thiểu xe `{v_id}`", LICENSE_LIST, index=LICENSE_LIST.index(suggested_lic), key=f"req_lic_{v_id}_{idx}")
+            
+            # 2. Tên tài xế (Quét từ chính DIM_DRIVER + hàng Thuê tài dự phòng)
             sel_driver = c2.selectbox(f"Chọn Tài xế cho xe `{v_id}`", driver_options, index=0, key=f"drv_name_{v_id}_{idx}")
             
             d_info = next((d for d in driver_db if d["driver_name"] == sel_driver), None)
             
-            # Kiểm tra điều kiện bằng lái và kho công tác
+            # Tự động lấy Bằng và Vai trò dựa theo Tài xế được chọn
+            cur_lic = d_info["license_type"] if d_info else ("—" if sel_driver != "Tài xế dự phòng (Thuê ngoài)" else "C")
+            cur_role = d_info["role"] if d_info else ("—" if sel_driver != "Tài xế dự phòng (Thuê ngoài)" else "Tài xế dự phòng")
+            
+            # 3. Loại bằng họ có (license_type)
+            c3.text_input(f"Bằng của tài xế", value=cur_lic, disabled=True, key=f"drv_lic_disp_{v_id}_{idx}")
+            
+            # 4. Vai trò của họ (Role)
+            c4.text_input(f"Vai trò", value=cur_role, disabled=True, key=f"drv_role_disp_{v_id}_{idx}")
+            
+            # Kiểm tra logic điều kiện bằng lái & kho
             if d_info is not None:
                 d_lic = d_info["license_type"]
                 d_wh = d_info["id_warehouse"]
@@ -1584,7 +1613,7 @@ def render_routing_tab():
                 else:
                     st.caption(f"✅ Bằng lái hợp lệ: **{d_lic}** (Đạt yêu cầu ≥ {req_lic})")
                     
-                if d_wh != v_wh:
+                if d_wh and d_wh != v_wh:
                     st.error(f"🔴 **Lỗi Kho Công Tác:** Xe `{v_id}` ở kho **{v_wh}** nhưng tài xế `{sel_driver}` thuộc kho **{d_wh}**.")
                     has_driver_error = True
             elif sel_driver == "Tài xế dự phòng (Thuê ngoài)":
@@ -1602,7 +1631,7 @@ def render_routing_tab():
             has_driver_error = True
 
     # ------------------------------------------------------------------------
-    # 🚛 BƯỚC 3: NHẬP LIỆU ĐỘI XE THUÊ NGOÀI (DYNAMIC ADD ROWS XE 3PL)
+    # 🚛 BƯỚC 3: NHẬP LIỆU ĐỘI XE THUÊ NGOÀI 3PL
     # ------------------------------------------------------------------------
     st.divider()
     st.markdown("## 🚛 3. NHẬP LIỆU ĐỘI XE THUÊ NGOÀI (3PL FULL & TÁCH CHUYẾN)")
@@ -1613,7 +1642,7 @@ def render_routing_tab():
     if not full_3pl_routes:
         st.info("🎉 Ngày này không có chuyến nào cần thuê ngoài xe 3PL Full!")
     else:
-        st.warning(f"⚠️ Phát hiện **{len(full_3pl_routes)} chuyến** cần thuê ngoài 3PL Full. Bạn có thể thêm nhiều hàng xe 3PL khác nhau (Ví dụ: 1 xe 10 tấn + 1 xe 5 tấn).")
+        st.warning(f"⚠️ Phát hiện **{len(full_3pl_routes)} chuyến** cần thuê ngoài 3PL Full. Bạn có thể thêm nhiều hàng xe 3PL khác nhau.")
         
         for idx, r in enumerate(full_3pl_routes, 1):
             req_w, req_v = route_load(r)
@@ -1623,12 +1652,10 @@ def render_routing_tab():
             st.markdown(f"##### 📌 Chuyến 3PL Full #{idx} (`{tag_type}`) — Yêu cầu tối thiểu: **Min {req_w:,.1f} kg** | **Min {req_v:.2f} m³**")
             st.caption(f"↳ Gồm {len(r['orders'])} đơn: {', '.join(o['order_id'] for o in r['orders'])}")
             
-            # Quản lý số lượng hàng xe 3PL bằng Session State
             num_rows_key = f"3pl_num_rows_{date_str}_{idx}"
             if num_rows_key not in st.session_state:
                 st.session_state[num_rows_key] = 1
                 
-            # 🚨 ĐIỀU KIỆN 3: Nút bấm (+) Thêm xe 3PL linh hoạt
             c_add, c_rem = st.columns([2, 8])
             if c_add.button(f"➕ Thêm 1 xe 3PL cho chuyến #{idx}", key=f"add_row_btn_{idx}"):
                 st.session_state[num_rows_key] += 1
@@ -1641,7 +1668,6 @@ def render_routing_tab():
             route_trucks = []
             total_cap_w, total_cap_v, total_cost = 0.0, 0.0, 0.0
             
-            # Hiển thị từng hàng xe 3PL
             for row_i in range(1, st.session_state[num_rows_key] + 1):
                 st.caption(f"👉 Hàng xe 3PL #{row_i}:")
                 r1, r2, r3, r4 = st.columns([2, 1.5, 1.5, 2])
@@ -1665,7 +1691,7 @@ def render_routing_tab():
             st.divider()
 
     # ------------------------------------------------------------------------
-    # 🚀 TÍNH KẾT QUẢ CUỐI CÙNG (KHÔNG BÓNG BAY)
+    # 🚀 TÍNH KẾT QUẢ CUỐI CÙNG
     # ------------------------------------------------------------------------
     if st.button("🚀 Kiểm Tra Điều Kiện & Tính Chi Phí Cuối Cùng", type="primary", key="btn_run_final_all"):
         if 'has_driver_error' in locals() and has_driver_error:
@@ -1707,7 +1733,6 @@ def render_routing_tab():
             r["outsourcing_cost"] = item["cost"]
             r["load_factor"] = item["req_v"] / item["cap_v"] if "Cube Out" in cfg.constraint_mode else item["req_w"] / item["cap_w"]
             
-        # Tính toán lại Chi phí
         day["day_cost"] = sum(route_total(rt) for rt in day["routes"])
         
         all_day_routes = day["routes"] + day["overdue_routes"]
@@ -1721,14 +1746,12 @@ def render_routing_tab():
         st.success("🎉 Đã phân công tài xế & cập nhật chi phí tổng thành công!")
 
     # ------------------------------------------------------------------------
-    # 🏆 BÁO CÁO KẾT QUẢ CUỐI CÙNG (KHÔNG BÓNG BAY)
+    # 🏆 BÁO CÁO KẾT QUẢ CUỐI CÙNG
     # ------------------------------------------------------------------------
     final_plan = st.session_state.get("t6_final_plan")
     if final_plan:
         st.divider()
         st.markdown(f"## 🏆 BÁO CÁO KẾT QUẢ ĐIỀU PHỐI CHÍNH THỨC — {date_str}")
-        
-        # 🚨 ĐIỀU KIỆN 1: Bỏ hiệu ứng thả bóng bay st.balloons()
         
         final_day = final_plan["days"][date_str]
         final_tagged = tag_routes(final_day)
