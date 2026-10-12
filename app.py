@@ -2063,7 +2063,7 @@ TAB_NAMES = [
 ]
 
 def main():
-    st.title("🚚 Smart Logistics — Dashboard Chuẩn hóa & Điều phối Vận tải (của Phạm Minh Thái)")
+    st.title("🚚 Smart Logistics — Hệ thống chuẩn hóa & Điều phối Vận tải (của Phạm Minh Thái)")
     with st.sidebar:
         st.markdown("### ℹ️ Menu Điều hướng")
         if st.button("🧹 Giải phóng RAM & Cache", key="free_ram"):
