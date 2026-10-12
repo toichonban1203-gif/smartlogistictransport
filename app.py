@@ -606,7 +606,7 @@ _ORDER_RAW = {
     "customer_id": dict(aliases=["mã khách", "customer id"]),
     "customer_name": dict(aliases=["tên khách", "customer name", "name"]),
     "quantity": dict(aliases=["số lượng", "qty", "quantity", "units"]),
-    "items": dict(aliases=["mặt hàng", "items", "product"]),
+    "items": dict(aliases=["mặt hàng", "items", "product", "sản phẩm"]),
     "total_weight_kg": dict(aliases=["trọng lượng", "weight", "kg"]),
     "total_volume_m3": dict(aliases=["thể tích", "volume", "m3"]),
     "address": dict(aliases=["địa chỉ", "address", "destination", "location", "vị trí"]),
@@ -663,12 +663,16 @@ def process_order_with_geocode(raw, do_geocode=True):
         else:
             geo_status = geo["status"]
             
+    items_str = str(raw.get("items", "")).strip()
+    if not items_str or items_str == "nan":
+        items_str = "Hàng hóa tiêu chuẩn"
+
     return {
         "order_id": str(raw.get("order_id", "")),
         "customer_id": str(raw.get("customer_id", "")),
         "customer_name": cust_name,
         "quantity": int(q or 1),
-        "items": str(raw.get("items", "")),
+        "items": items_str,
         "total_weight_kg": round(w or 0.0, 4),
         "total_volume_m3": round(v or 0.0, 6),
         "address": cleaned_addr,
@@ -973,10 +977,12 @@ def load_orders(cfg: Config, notes: list) -> list:
         lat = float(r["lat"]) if pd.notna(r.get("lat")) else None
         lng = float(r["lng"]) if pd.notna(r.get("lng")) else None
         qty = int(parse_qty(r.get("quantity")) or 1)
+        items_str = "" if is_blank(r.get("items")) else str(r["items"]).strip()
         
         orders.append({
             "order_id": oid, "customer_id": cid, "order_type": otype if otype in ("B2B", "B2C") else "B2C",
             "quantity": qty,
+            "items": items_str or "Hàng tiêu chuẩn",
             "total_weight_kg": parse_qty(r.get("total_weight_kg")), "total_volume_m3": parse_qty(r.get("total_volume_m3"), dot_is_decimal=True),
             "address": "" if is_blank(r.get("address")) else str(r["address"]),
             "lat": lat, "lng": lng,
@@ -1422,6 +1428,26 @@ def route_label(idx, r, wh_info) -> str:
 def route_load(r):
     return sum(o["total_weight_kg"] for o in r["orders"]), sum(o["total_volume_m3"] for o in r["orders"])
 
+def route_items_detail(r) -> str:
+    """TẠO MÔ TẢ CHI TIẾT CÁC MẶT HÀNG & ĐƠN VỊ CỦA TUYẾN (DÙNG CHO BẢNG 1 & BẢNG 3)"""
+    item_map = {}
+    for o in r["orders"]:
+        it_name = o.get("items") or "Hàng tiêu chuẩn"
+        q = o.get("quantity", 1)
+        w = o.get("total_weight_kg", 0.0)
+        v = o.get("total_volume_m3", 0.0)
+        
+        if it_name not in item_map:
+            item_map[it_name] = {"qty": 0, "w": 0.0, "v": 0.0}
+        item_map[it_name]["qty"] += q
+        item_map[it_name]["w"] += w
+        item_map[it_name]["v"] += v
+        
+    parts = []
+    for it, d in item_map.items():
+        parts.append(f"{d['qty']} x {it} ({d['w']:,.0f}kg | {d['v']:.2f}m³)")
+    return " + ".join(parts)
+
 def route_vehicle_text(r) -> str:
     reason_text = r.get("reason") or "Vượt khả năng xe nhà"
     if r["external"]:
@@ -1436,19 +1462,32 @@ def routes_to_df(tagged_routes, wh_info, cfg: Config) -> pd.DataFrame:
         locs = sorted({re.split(r",|\s-\s", o["address"])[-1].strip() for o in r["orders"] if o["address"]})
         tw, tv = route_load(r)
         tq = sum(o.get("quantity", 1) for o in r["orders"])
+        items_detail = route_items_detail(r)
+        
         rows.append({
-            "MÃ TUYẾN": route_label(idx, r, wh_info), "KHU VỰC": ", ".join(locs), "LOẠI": kind,
+            "MÃ TUYẾN": route_label(idx, r, wh_info), 
+            "KHU VỰC": ", ".join(locs), 
+            "LOẠI": kind,
             "THỨ TỰ KHÁCH GHÉP": " → ".join(r["route"]),
-            "ĐƠN GIAO": ", ".join(o["order_id"] for o in r["orders"]), "SỐ ĐƠN": len(r["orders"]), "TỔNG UNITS": tq,
-            "TỔNG TRỌNG TẢI (kg)": round(tw, 1), "TỔNG THỂ TÍCH (m³)": round(tv, 2),
+            "ĐƠN GIAO": ", ".join(o["order_id"] for o in r["orders"]), 
+            "SỐ ĐƠN": len(r["orders"]), 
+            "TỔNG UNITS": tq,
+            "CHI TIẾT MẶT HÀNG & ĐƠN VỊ": items_detail,
+            "TỔNG TRỌNG TẢI (kg)": round(tw, 1), 
+            "TỔNG THỂ TÍCH (m³)": round(tv, 2),
             "TẢI TRỌNG XE (kg)": round(float(r.get("cap_w", 0.0)), 1),
             "THỂ TÍCH XE (m³)": round(float(r.get("cap_v", 0.0)), 2),
             "TÀI XẾ CHÍNH": r.get("driver_primary", "Chờ phân công"),
-            "PHỤ XE": r.get("driver_assistant", "—"), "XE": route_vehicle_text(r),
-            "BIỂN SỐ": r["license_plate"], "CHUYẾN": f"{r['trip_no']}/{cfg.vehicle_daily_count}" if r.get("trip_no") else "—",
-            "QUÃNG ĐƯỜNG (km)": r["km"], "LẤP ĐẦY (%)": round(r["load_factor"] * 100, 1),
-            "THỜI GIAN (giờ)": round(r["hours"], 2), "TỔNG CHI PHÍ (đ)": round(route_total(r)) if route_total(r) > 0 else "Chờ nhập giá 3PL",
-            "BẮT ĐẦU": f"{r['start']:%H:%M}", "KẾT THÚC": f"{r['end']:%H:%M}",
+            "PHỤ XE": r.get("driver_assistant", "—"), 
+            "XE": route_vehicle_text(r),
+            "BIỂN SỐ": r["license_plate"], 
+            "CHUYẾN": f"{r['trip_no']}/{cfg.vehicle_daily_count}" if r.get("trip_no") else "—",
+            "QUÃNG ĐƯỜNG (km)": r["km"], 
+            "LẤP ĐẦY (%)": round(r["load_factor"] * 100, 1),
+            "THỜI GIAN (giờ)": round(r["hours"], 2), 
+            "TỔNG CHI PHÍ (đ)": round(route_total(r)) if route_total(r) > 0 else "Chờ nhập giá 3PL",
+            "BẮT ĐẦU": f"{r['start']:%H:%M}", 
+            "KẾT THÚC": f"{r['end']:%H:%M}",
             "TRẠNG THÁI": ("🟣 Cần xe 3PL Full" if (r["external"] and "FULL" in str(r.get("vehicle_id", "")).upper()) else 
                            ("🟣 Giao bởi 3PL Tiết kiệm" if r["external"] else ("🟠 Tách: xe nhà + 3PL" if r["kind"] == "SPLIT" else
                            ("✅ Đã tối ưu" if r["hours"] <= cfg.max_route_hours + 1e-9 else "⚠️ Vượt giới hạn giờ")))),
@@ -1570,7 +1609,6 @@ def render_routing_tab():
             
             st.markdown(f"##### 🚚 Xe #{idx}: `{v_id}` (Kho: **{v_wh}** | Tải trọng: **{v_cap_w:,.0f} kg**)")
             
-            # Chọn loại tài xế
             driver_choice = st.radio(
                 f"Hình thức tài xế cho xe `{v_id}`",
                 ["Nhập tên tài xế công ty", "Thành phần dự phòng (Thuê ngoài)"],
@@ -1580,15 +1618,11 @@ def render_routing_tab():
             
             c1, c2, c3, c4 = st.columns([1.5, 3, 1.5, 2])
             
-            # 1. Bằng tối thiểu cho xe đó
             req_lic = c1.selectbox(f"Bằng tối thiểu xe `{v_id}`", LICENSE_LIST, index=LICENSE_LIST.index(suggested_lic), key=f"req_lic_{v_id}_{idx}")
             
             if driver_choice == "Nhập tên tài xế công ty":
-                # 2. Tên tài xế (Nhập TEXT trực tiếp)
                 sel_driver = c2.text_input(f"Nhập Tên Tài xế", placeholder="Ví dụ: Nguyễn Văn A", key=f"drv_name_txt_{v_id}_{idx}").strip()
-                # 3. Loại bằng họ có
                 cur_lic = c3.selectbox(f"Bằng của tài xế", LICENSE_LIST, index=LICENSE_LIST.index("C"), key=f"drv_lic_inp_{v_id}_{idx}")
-                # 4. Vai trò
                 cur_role = c4.text_input(f"Vai trò", value="Tài xế chính", key=f"drv_role_inp_{v_id}_{idx}")
                 
                 if not sel_driver:
@@ -1627,14 +1661,18 @@ def render_routing_tab():
     if not full_3pl_routes:
         st.info("🎉 Ngày này không có chuyến nào cần thuê ngoài xe 3PL Full!")
     else:
-        st.warning(f"⚠️ Phát hiện **{len(full_3pl_routes)} chuyến** cần thuê ngoài 3PL Full. Bạn có thể thêm nhiều hàng xe 3PL khác nhau.")
+        st.warning(f"⚠️ Phát hiện **{len(full_3pl_routes)} chuyến** cần thuê ngoài 3PL Full. Hãy kiểm tra danh sách mặt hàng & đơn vị bên dưới để chọn/ghép xe 3PL phù hợp.")
         
         for idx, r in enumerate(full_3pl_routes, 1):
             req_w, req_v = route_load(r)
+            req_qty = sum(o.get("quantity", 1) for o in r["orders"])
+            items_desc = route_items_detail(r)
             is_split = r["kind"] == "SPLIT"
             tag_type = "Tách chuyến xe nhà + 3PL" if is_split else "Thuần Thuê ngoài 3PL Full"
             
-            st.markdown(f"##### 📌 Chuyến 3PL Full #{idx} (`{tag_type}`) — Yêu cầu tối thiểu: **Min {req_w:,.1f} kg** | **Min {req_v:.2f} m³**")
+            st.markdown(f"##### 📌 Chuyến 3PL Full #{idx} (`{tag_type}`)")
+            st.markdown(f"📦 **Tổng yêu cầu:** **{req_qty} đơn vị hàng (Units)** | **{req_w:,.1f} kg** | **{req_v:.2f} m³**")
+            st.markdown(f"🛍️ **Danh sách mặt hàng cần tải:** `{items_desc}`")
             st.caption(f"↳ Gồm {len(r['orders'])} đơn: {', '.join(o['order_id'] for o in r['orders'])}")
             
             num_rows_key = f"3pl_num_rows_{date_str}_{idx}"
@@ -1668,7 +1706,7 @@ def render_routing_tab():
                 route_trucks.append(f"{v_name} ({v_w:,.0f}kg/{v_v:.1f}m³)")
 
             user_3pl_inputs.append({
-                "req_w": req_w, "req_v": req_v,
+                "req_w": req_w, "req_v": req_v, "req_qty": req_qty,
                 "name": f"{st.session_state[num_rows_key]} xe 3PL [" + " + ".join(route_trucks) + "]",
                 "cap_w": total_cap_w, "cap_v": total_cap_v,
                 "cost": total_cost, "route": r
@@ -1686,13 +1724,12 @@ def render_routing_tab():
         valid_3pl = True
         for idx, item in enumerate(user_3pl_inputs, 1):
             if item["cap_w"] < item["req_w"] - 1e-5 or item["cap_v"] < item["req_v"] - 1e-5:
-                st.error(f"❌ Các xe 3PL ghép cho chuyến #{idx} không đủ năng lực! "
-                         f"Cần tối thiểu {item['req_w']:,.1f}kg / {item['req_v']:.2f}m³, nhưng tổng các xe bạn chọn chỉ đạt {item['cap_w']:,.1f}kg / {item['cap_v']:.2f}m³.")
+                st.error(f"❌ Các xe 3PL ghép cho chuyến #{idx} không đủ tải trọng/thể tích! "
+                         f"Cần tối thiểu {item['req_qty']} Đơn vị hàng ({item['req_w']:,.1f}kg / {item['req_v']:.2f}m³), nhưng tổng sức tải xe bạn nhập chỉ đạt {item['cap_w']:,.1f}kg / {item['cap_v']:.2f}m³.")
                 valid_3pl = False
         
         if not valid_3pl: return
         
-        # Cập nhật phân công tài xế
         assign_map = {a["vehicle_id"]: a for a in 'assignments' in locals() and assignments or []}
         for r, _ in tagged:
             if not r["external"]:
@@ -1708,7 +1745,6 @@ def render_routing_tab():
                         r["is_backup_driver"] = True
                         r["driver_cost"] = cfg.backup_driver_cost
 
-        # Cập nhật đội xe 3PL Full
         for item in user_3pl_inputs:
             r = item["route"]
             r["vehicle_type"] = item["name"]
