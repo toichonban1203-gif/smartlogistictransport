@@ -779,7 +779,6 @@ def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_ava
     sum_fleet_w, sum_fleet_v = df_vehicles["max_weight_kg"].sum(), df_vehicles["max_volume_m3"].sum()
     avail = df_vehicles[df_vehicles["vehicle_id"].map(lambda x: vehicle_available_counts.get(x, 1) > 0)]
     
-    # 🚨 Nếu tổng tải vượt quá 150% xe lớn nhất công ty -> THUÊ NGOÀI FULL NGAY LẬP TỨC
     if total_w > 1.5 * max_fleet_w or total_v > 1.5 * max_fleet_v or total_w > sum_fleet_w or total_v > sum_fleet_v:
         return outsourced("OUTSOURCE_FULL", _full_cls(total_w, total_v, oc, f"hàng quá khủng vượt 150% xe lớn nhất nhà ({max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³)"),
                         f"🚨 Hàng quá khủng (vượt >150% xe lớn nhất nhà {max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³) -> Thuê ngoài 3PL Full ngay lập tức.")
@@ -919,10 +918,8 @@ def load_customers(cfg: Config) -> dict:
             out[cid] = {"lat": float(r["lat"]), "lng": float(r["lng"]), "name": "" if is_blank(r.get("customer_name")) else str(r["customer_name"])}
     return out
 
-# 🚨 CHUẨN HÓA LẤY DỮ LIỆU TÀI XẾ TỪ FILE HOẶC DỰ PHÒNG TỪ SESSION STATE (TAB 4)
 def load_drivers_raw(cfg: Config) -> list:
     drivers = []
-    # Nguồn 1: Đọc từ file DIM_DRIVER.xlsx nếu đã lưu
     if os.path.exists(cfg.driver_file):
         try:
             df = read_dim_file(cfg.driver_file)
@@ -938,7 +935,6 @@ def load_drivers_raw(cfg: Config) -> list:
             if drivers: return drivers
         except Exception: pass
 
-    # Nguồn 2: Nếu chưa có file, lấy từ Tab Driver (Session State)
     raw_state = st.session_state.get("driver_raw")
     if raw_state is not None and len(raw_state) > 0:
         for _, r in raw_state.iterrows():
@@ -1549,7 +1545,7 @@ def render_routing_tab():
     st.dataframe(rdf_temp[cols_to_show], hide_index=True)
     
     # ------------------------------------------------------------------------
-    # 👨‍✈️ BƯỚC 2: BẢNG PHÂN CÔNG TÀI XẾ CHUẨN 4 CỘT
+    # 👨‍✈️ BƯỚC 2: BẢNG PHÂN CÔNG TÀI XẾ (NHẬP TEXT / THUÊ NGOÀI)
     # ------------------------------------------------------------------------
     st.divider()
     st.markdown("## 👨‍✈️ 2. PHÂN CÔNG TÀI XẾ CHO CÁC XE NHÀ HOẠT ĐỘNG TRONG NGÀY")
@@ -1560,11 +1556,7 @@ def render_routing_tab():
     if not active_vehicles:
         st.info("🎉 Ngày này toàn bộ đơn giao bằng 3PL, không có xe nhà nào cần phân công tài xế.")
     else:
-        st.markdown("Vui lòng phân công tài xế từ bảng `DIM_DRIVER` bên dưới. Mỗi tài xế chỉ lái 1 xe/ngày.")
-        
-        # Lấy danh sách tài xế chuẩn xác từ load_drivers_raw
-        driver_db = data.get("drivers_raw", [])
-        driver_options = ["-- Chọn Tài xế --", "Tài xế dự phòng (Thuê ngoài)"] + [d["driver_name"] for d in driver_db]
+        st.markdown("Vui lòng nhập tên tài xế hoặc chọn tùy chọn Thuê ngoài tài xế dự phòng bên dưới.")
         
         assignments = []
         has_driver_error = False
@@ -1578,57 +1570,50 @@ def render_routing_tab():
             
             st.markdown(f"##### 🚚 Xe #{idx}: `{v_id}` (Kho: **{v_wh}** | Tải trọng: **{v_cap_w:,.0f} kg**)")
             
-            # 🚨 BẢNG 2 CHUẨN ĐỦ 4 CỘT CẬU YÊU CẦU
+            # Chọn loại tài xế
+            driver_choice = st.radio(
+                f"Hình thức tài xế cho xe `{v_id}`",
+                ["Nhập tên tài xế công ty", "Thành phần dự phòng (Thuê ngoài)"],
+                horizontal=True,
+                key=f"drv_choice_{v_id}_{idx}"
+            )
+            
             c1, c2, c3, c4 = st.columns([1.5, 3, 1.5, 2])
             
             # 1. Bằng tối thiểu cho xe đó
             req_lic = c1.selectbox(f"Bằng tối thiểu xe `{v_id}`", LICENSE_LIST, index=LICENSE_LIST.index(suggested_lic), key=f"req_lic_{v_id}_{idx}")
             
-            # 2. Tên tài xế (Quét từ chính DIM_DRIVER + hàng Thuê tài dự phòng)
-            sel_driver = c2.selectbox(f"Chọn Tài xế cho xe `{v_id}`", driver_options, index=0, key=f"drv_name_{v_id}_{idx}")
-            
-            d_info = next((d for d in driver_db if d["driver_name"] == sel_driver), None)
-            
-            # Tự động lấy Bằng và Vai trò dựa theo Tài xế được chọn
-            cur_lic = d_info["license_type"] if d_info else ("—" if sel_driver != "Tài xế dự phòng (Thuê ngoài)" else "C")
-            cur_role = d_info["role"] if d_info else ("—" if sel_driver != "Tài xế dự phòng (Thuê ngoài)" else "Tài xế dự phòng")
-            
-            # 3. Loại bằng họ có (license_type)
-            c3.text_input(f"Bằng của tài xế", value=cur_lic, disabled=True, key=f"drv_lic_disp_{v_id}_{idx}")
-            
-            # 4. Vai trò của họ (Role)
-            c4.text_input(f"Vai trò", value=cur_role, disabled=True, key=f"drv_role_disp_{v_id}_{idx}")
-            
-            # Kiểm tra logic điều kiện bằng lái & kho
-            if d_info is not None:
-                d_lic = d_info["license_type"]
-                d_wh = d_info["id_warehouse"]
+            if driver_choice == "Nhập tên tài xế công ty":
+                # 2. Tên tài xế (Nhập TEXT trực tiếp)
+                sel_driver = c2.text_input(f"Nhập Tên Tài xế", placeholder="Ví dụ: Nguyễn Văn A", key=f"drv_name_txt_{v_id}_{idx}").strip()
+                # 3. Loại bằng họ có
+                cur_lic = c3.selectbox(f"Bằng của tài xế", LICENSE_LIST, index=LICENSE_LIST.index("C"), key=f"drv_lic_inp_{v_id}_{idx}")
+                # 4. Vai trò
+                cur_role = c4.text_input(f"Vai trò", value="Tài xế chính", key=f"drv_role_inp_{v_id}_{idx}")
                 
-                req_rank = LICENSE_RANKS.get(req_lic, 6)
-                drv_rank = LICENSE_RANKS.get(d_lic, 6)
-                
-                if drv_rank < req_rank:
-                    st.error(f"🔴 **Lỗi Bằng Lái:** Tài xế `{sel_driver}` (Bằng `{d_lic}`) KHÔNG ĐỦ điều kiện lái xe `{v_id}` (Yêu cầu bằng `{req_lic}`).")
+                if not sel_driver:
+                    st.warning("⚠️ Vui lòng nhập tên tài xế!")
                     has_driver_error = True
                 else:
-                    st.caption(f"✅ Bằng lái hợp lệ: **{d_lic}** (Đạt yêu cầu ≥ {req_lic})")
-                    
-                if d_wh and d_wh != v_wh:
-                    st.error(f"🔴 **Lỗi Kho Công Tác:** Xe `{v_id}` ở kho **{v_wh}** nhưng tài xế `{sel_driver}` thuộc kho **{d_wh}**.")
-                    has_driver_error = True
-            elif sel_driver == "Tài xế dự phòng (Thuê ngoài)":
-                st.info("ℹ️ Sẽ tính thêm chi phí Thuê tài xế dự phòng.")
+                    req_rank = LICENSE_RANKS.get(req_lic, 6)
+                    drv_rank = LICENSE_RANKS.get(cur_lic, 6)
+                    if drv_rank < req_rank:
+                        st.error(f"🔴 **Lỗi Bằng Lái:** Tài xế `{sel_driver}` (Bằng `{cur_lic}`) KHÔNG ĐỦ điều kiện lái xe `{v_id}` (Yêu cầu bằng `{req_lic}`).")
+                        has_driver_error = True
+                    else:
+                        st.caption(f"✅ Bằng lái hợp lệ: **{cur_lic}** (Đạt yêu cầu ≥ {req_lic})")
             else:
-                st.caption("⚠️ Chưa phân công tài xế.")
+                sel_driver = "Tài xế dự phòng (Thuê ngoài)"
+                cur_lic = "C"
+                cur_role = "Tài xế dự phòng"
+                
+                c2.text_input(f"Tên Tài xế", value=sel_driver, disabled=True, key=f"drv_name_dis_{v_id}_{idx}")
+                c3.text_input(f"Bằng của tài xế", value=cur_lic, disabled=True, key=f"drv_lic_dis_{v_id}_{idx}")
+                c4.text_input(f"Vai trò", value=cur_role, disabled=True, key=f"drv_role_dis_{v_id}_{idx}")
+                st.info("ℹ️ Sẽ tính thêm chi phí Thuê tài xế dự phòng.")
 
-            assignments.append({"vehicle_id": v_id, "driver_name": sel_driver})
+            assignments.append({"vehicle_id": v_id, "driver_name": sel_driver, "license_type": cur_lic, "role": cur_role})
             st.divider()
-
-        assigned_names = [a["driver_name"] for a in assignments if a["driver_name"] not in ("-- Chọn Tài xế --", "Tài xế dự phòng (Thuê ngoài)")]
-        if len(assigned_names) != len(set(assigned_names)):
-            dup = set([x for x in assigned_names if assigned_names.count(x) > 1])
-            st.error(f"🔴 **Lỗi Trùng Lặp:** Tài xế `{', '.join(dup)}` đang bị gán cho nhiều xe!")
-            has_driver_error = True
 
     # ------------------------------------------------------------------------
     # 🚛 BƯỚC 3: NHẬP LIỆU ĐỘI XE THUÊ NGOÀI 3PL
@@ -1714,7 +1699,7 @@ def render_routing_tab():
                 vid = r["vehicle_id"]
                 if vid in assign_map:
                     a = assign_map[vid]
-                    if a["driver_name"] not in ("-- Chọn Tài xế --", "Tài xế dự phòng (Thuê ngoài)"):
+                    if a["driver_name"] != "Tài xế dự phòng (Thuê ngoài)":
                         r["driver_primary"] = a["driver_name"]
                         r["is_backup_driver"] = False
                         r["driver_cost"] = 0.0
