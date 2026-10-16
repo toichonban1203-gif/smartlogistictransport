@@ -1257,8 +1257,9 @@ class RoutePlanner:
                     ev.append({"sev": sev, "kind": kind, "detail": ta["message"], "why": reason,
                                "handled": f"Cắt xe {vid} + thuê ngoài {ta['cls']['type']}", "propose": propose})
                 orders = [o for c in r for o in by_cust[c]]
-                end_dt = start + dt.timedelta(hours=hours + cfg.turnaround_min / 60.0)
-                veh_free[vid] = f"{end_dt:%H:%M}" if end_dt.date() == start.date() else "23:59"
+                end_dt = start + dt.timedelta(hours=hours)
+                next_start_dt = end_dt + dt.timedelta(minutes=cfg.turnaround_min)
+                veh_free[vid] = f"{next_start_dt:%H:%M}" if next_start_dt.date() == start.date() else "23:59"
                 
                 load_factor = self._calculate_load_factor(m, vrow, {})
                 
@@ -1277,7 +1278,7 @@ class RoutePlanner:
                     "cap_w": cap_w, "cap_v": cap_v, "total_weight_kg": m["w"], "total_volume_m3": m["v"], "total_qty": m["qty"],
                     "reason": reason if split else "",
                     "trip_no": max(1, cfg.vehicle_daily_count - veh_counts.get(vid, 0)),
-                    "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours, "events": ev,
+                    "start": start, "end": end_dt, "hours": hours, "events": ev,
                 })
         if cut:
             ids = [c for c, _, _, _ in cut]
@@ -1550,12 +1551,17 @@ def render_routing_tab():
     st.dataframe(rdf_temp[cols_to_show], hide_index=True)
     
     st.divider()
-    st.markdown("## 👨‍✈️ 2. PHÂN CÔNG TÀI XẾ CHO CÁC XE NHÀ HOẠT ĐỘNG TRONG NGÀY")
+    st.markdown("## 👨‍✈️ 2. PHÂN CÔNG TÀI XẾ CÔNG TY CHO CÁC XE NHÀ HOẠT ĐỘNG TRONG NGÀY")
     
     inhouse_routes = [r for r, _ in tagged if not r["external"]]
-    active_vehicles = list({r["vehicle_id"]: r for r in inhouse_routes}.values())
     
-    if not active_vehicles:
+    # Gom nhóm theo xe nhà để biết lịch chạy từng lần trong ngày
+    veh_grouped = {}
+    for r in inhouse_routes:
+        vid = r["vehicle_id"]
+        veh_grouped.setdefault(vid, []).append(r)
+        
+    if not veh_grouped:
         st.info("🎉 Ngày này toàn bộ đơn giao bằng 3PL, không có xe nhà nào cần phân công tài xế.")
     else:
         st.markdown("Vui lòng nhập tên tài xế hoặc chọn tùy chọn Thuê ngoài tài xế dự phòng bên dưới.")
@@ -1563,14 +1569,23 @@ def render_routing_tab():
         assignments = []
         has_driver_error = False
         
-        for idx, veh in enumerate(active_vehicles, 1):
-            v_id = veh["vehicle_id"]
-            v_wh = veh["id_warehouse"]
-            v_cap_w = veh["cap_w"]
+        for idx, (v_id, r_list) in enumerate(veh_grouped.items(), 1):
+            r_list.sort(key=lambda x: x["start"])
+            first_r = r_list[0]
+            v_wh = first_r["id_warehouse"]
+            v_cap_w = first_r["cap_w"]
             
             suggested_lic = "B2" if v_cap_w < 3500 else ("C" if v_cap_w <= 15000 else "FC")
             
-            st.markdown(f"##### 🚚 Xe #{idx}: `{v_id}` (Kho: **{v_wh}** | Tải trọng: **{v_cap_w:,.0f} kg**)")
+            st.markdown(f"##### 🚚 Xe #{idx}: `{v_id}` (Kho: **{v_wh}** | Tải trọng: **{v_cap_w:,.0f} kg** | **{len(r_list)} chuyến trong ngày**)")
+            
+            # --- HIỂN THỊ LỊCH TRÌNH CHẠY TRONG NGÀY ---
+            st.markdown("🕒 **Lịch trình chạy thực tế trong ngày:**")
+            for trip_idx, r_item in enumerate(r_list, 1):
+                start_s = f"{r_item['start']:%H:%M}"
+                end_s = f"{r_item['end']:%H:%M}"
+                ord_ids = ", ".join(o["order_id"] for o in r_item["orders"])
+                st.caption(f"  • **Lần {trip_idx}:** Từ **{start_s}** đến **{end_s}** ({r_item['hours']:.2f} giờ) — Giao đơn: `{ord_ids}`")
             
             driver_choice = st.radio(
                 f"Hình thức tài xế cho xe `{v_id}`",
