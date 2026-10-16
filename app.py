@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import io
 import json
 import os
@@ -9,7 +8,6 @@ import math
 import time
 import datetime as dt
 from dataclasses import dataclass, field
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,18 +19,15 @@ from unidecode import unidecode
 # ⚙️ MÀN HÌNH & TỔNG QUAN HỆ THỐNG
 # ============================================================================
 st.set_page_config(page_title="Smart Logistics Dashboard", page_icon="🚚", layout="wide")
-
 NONE = "-- Không sử dụng --"
 INPUT_MODES = ["Nhập trực tiếp (Data Editor)", "Upload file Excel/CSV/JSON"]
 UPLOAD_TYPES = ["xlsx", "xls", "xlsm", "csv", "json"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 VIETNAM_BOUNDS = (8.0, 24.5, 102.0, 110.0)
 BASE_DIR = os.getcwd()
-
 OUT_FLEET = os.path.join(BASE_DIR, "output_fleet")
 OUT_WAREHOUSE = os.path.join(BASE_DIR, "output_warehouse")
 OUT_PRODUCT = os.path.join(BASE_DIR, "output_product")
-OUT_DRIVER = os.path.join(BASE_DIR, "output_driver")
 OUT_ORDERS = os.path.join(BASE_DIR, "output_orders")
 OUT_CUSTOMER = os.path.join(BASE_DIR, "output_customer")
 OUT_MATRIX = os.path.join(BASE_DIR, "output_matrix")
@@ -547,53 +542,7 @@ def render_product_tab():
     render_result("product", "📊 Kết quả Sản phẩm")
 
 # ============================================================================
-# 👨‍✈️ TAB 4: DRIVER
-# ============================================================================
-DRIVER_FIELDS = {
-    "driver_id": ["mã tài xế", "driver id", "driver code", "mã nv", "id"],
-    "driver_name": ["họ và tên", "tên tài xế", "full name", "name"],
-    "license_type": ["loại bằng", "bằng lái", "license"],
-    "id_warehouse": ["kho", "warehouse", "trạm", "hub", "id kho"],
-    "phone": ["số điện thoại", "phone", "sdt"],
-    "role": ["vị trí", "role", "chức vụ"],
-}
-
-def process_driver(rec):
-    out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in DRIVER_FIELDS}
-    lic = out["license_type"].upper()
-    out["license_type"] = lic if lic in LICENSE_RANKS else "C"
-    out["trạng_thái"] = "✅ Hợp lệ"
-    return out
-
-def driver_validate_output(df):
-    out = df.copy()
-    msgs = []
-    for _, row in out.iterrows():
-        errs = []
-        if is_blank(row.get("driver_id")): errs.append("Thiếu id")
-        if is_blank(row.get("driver_name")): errs.append("Thiếu tên")
-        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Hợp lệ")
-    out["kiểm_tra"] = msgs
-    return out
-
-def render_driver_tab():
-    st.header("👨‍✈️ Quản lý Tài xế (Driver)")
-    mode, edited, uploaded = render_input_block("driver", "tài xế", pd.DataFrame({"driver_id": ["DRV_06"], "driver_name": ["Nguyễn Văn A"], "license_type": ["FC"], "id_warehouse": ["WH_HN_01"], "phone": ["0901234567"], "role": ["Tài xế chính"]}))
-    if st.button("🔍 Quét & Mapping", key="driver_scan", type="primary"):
-        run_scan("driver", "tài xế", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, DRIVER_FIELDS, lambda s, f: 0.8, 0.35))
-    raw = st.session_state.get("driver_raw")
-    if raw is None: return
-    chosen = render_mapping("driver", list(DRIVER_FIELDS), raw)
-    if st.button("🚀 Chuẩn hóa Tài xế", key="driver_process", type="primary"):
-        colmap = build_colmap(raw, chosen)
-        rows = [process_driver({f: pick(r, colmap, f, None) for f in DRIVER_FIELDS}) for _, r in raw.iterrows()]
-        out = driver_validate_output(pd.DataFrame(rows))
-        files = save_outputs(OUT_DRIVER, "DIM_DRIVER", "DIM_DRIVER", out)
-        store_result("driver", out, files, "🧭 Hoàn tất chuẩn hóa tài xế", [("Tổng tài xế", len(out))])
-    render_result("driver", "📊 Kết quả Tài xế")
-
-# ============================================================================
-# 🧾 TAB 5: ORDERS
+# 🧾 TAB 4: ORDERS
 # ============================================================================
 _ORDER_RAW = {
     "order_id": dict(aliases=["mã đơn", "order id", "order code"]),
@@ -691,6 +640,11 @@ def orders_validate_output(df):
     out["kiểm_tra"] = msgs
     return out
 
+def is_hanoi_address(addr_str: str) -> bool:
+    if not addr_str: return False
+    norm = norm_basic(addr_str)
+    return "ha noi" in norm or "hanoi" in norm
+
 def render_orders_tab():
     st.header("🧾 Quản lý Đơn hàng & Quét Tọa độ (Orders)")
     do_geo = st.checkbox("🌍 Tự động quét ArcGIS Geocoding cho Location/Address đơn hàng", value=True, key="ord_do_geo")
@@ -707,17 +661,95 @@ def render_orders_tab():
             for _, row in raw.iterrows():
                 rows.append(process_order_with_geocode({f: row.get(c) for f, c in colmap.items()}, do_geocode=do_geo))
         out = orders_validate_output(pd.DataFrame(rows))
+        
+        # 1. Lưu file tổng chuẩn DIM_ORDERS
         files = save_outputs(OUT_ORDERS, "DIM_ORDERS", "DIM_ORDERS", out)
         
+        # 2. Phân tách thành 3 bảng với cấu trúc y hệt bảng gốc
+        mask_failed = out["trạng_thái_geocode"] != "✅ Thành công"
+        df_failed = out[mask_failed].copy().reset_index(drop=True)
+        
+        df_success = out[~mask_failed].copy()
+        mask_hanoi = df_success["address"].apply(is_hanoi_address)
+        df_hanoi = df_success[mask_hanoi].copy().reset_index(drop=True)
+        df_outside = df_success[~mask_hanoi].copy().reset_index(drop=True)
+        
+        # Lưu các file phụ trợ
+        file_hn = save_outputs(OUT_ORDERS, "DIM_ORDERS_HA_NOI", "DIM_ORDERS_HA_NOI", df_hanoi)
+        file_out = save_outputs(OUT_ORDERS, "DIM_ORDERS_OUTSIDE_HN", "DIM_ORDERS_OUTSIDE_HN", df_outside)
+        file_err = save_outputs(OUT_ORDERS, "DIM_ORDERS_FAILED", "DIM_ORDERS_FAILED", df_failed)
+        
+        files.extend([file_hn[0], file_out[0], file_err[0]])
+        
+        # Lưu thông tin Customer
         cust_df = out.dropna(subset=["lat", "lng"])[["customer_id", "customer_name", "address", "lat", "lng", "trạng_thái_geocode"]].drop_duplicates(subset=["customer_id"])
         save_outputs(OUT_CUSTOMER, "DATASET_CUSTOMER", "DATASET_CUSTOMER", cust_df)
         
         ok_count = int((out["trạng_thái_geocode"] == "✅ Thành công").sum())
-        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa & quét tọa độ đơn hàng", [("Tổng đơn", len(out)), ("Quét tọa độ OK", f"{ok_count}/{len(out)}")])
-    render_result("orders", "📊 Kết quả Đơn hàng")
+        
+        extra = {
+            "df_hanoi": optimize_dtypes(df_hanoi, categorize=True),
+            "df_outside": optimize_dtypes(df_outside, categorize=True),
+            "df_failed": optimize_dtypes(df_failed, categorize=True),
+        }
+        
+        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa & phân loại đơn hàng", [
+            ("Tổng số đơn", len(out)),
+            ("Đơn Hà Nội", len(df_hanoi)),
+            ("Đơn Ngoài Hà Nội", len(df_outside)),
+            ("Lỗi Geocode", len(df_failed))
+        ], extra=extra)
+        
+    res = st.session_state.get("orders_result")
+    if res is not None:
+        st.markdown("### 📊 Kết quả Phân Loại Đơn Hàng")
+        st.success(res["summary"])
+        
+        if res["metrics"]:
+            cols = st.columns(len(res["metrics"]))
+            for c, (lab, val) in zip(cols, res["metrics"]): c.metric(lab, val)
+            
+        extra = res.get("extra", {})
+        df_hn = extra.get("df_hanoi", pd.DataFrame())
+        df_out = extra.get("df_outside", pd.DataFrame())
+        df_fail = extra.get("df_failed", pd.DataFrame())
+        
+        t_hn, t_out, t_fail, t_all = st.tabs([
+            f"🏢 1. Đơn tại Hà Nội ({len(df_hn)})",
+            f"🌏 2. Đơn ngoài Hà Nội ({len(df_out)})",
+            f"⚠️ 3. Không quét được tọa độ ({len(df_fail)})",
+            f"📋 4. Tất cả đơn tổng ({len(res['df'])})"
+        ])
+        
+        with t_hn:
+            st.markdown("##### 🏢 Danh sách các đơn hàng thuộc khu vực Hà Nội")
+            st.dataframe(df_hn, use_container_width=True)
+            
+        with t_out:
+            st.markdown("##### 🌏 Danh sách các đơn hàng ngoài khu vực Hà Nội")
+            st.dataframe(df_out, use_container_width=True)
+            
+        with t_fail:
+            st.markdown("##### ⚠️ Danh sách các đơn hàng không quét được tọa độ")
+            st.dataframe(df_fail, use_container_width=True)
+            
+        with t_all:
+            st.markdown("##### 📋 Bảng tổng hợp tất cả đơn hàng")
+            st.dataframe(res["df"], use_container_width=True)
+
+        st.caption(f"🧠 RAM kết quả: {mem_kb(res['df']):,.1f} KB")
+        rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
+        st.info(f"📁 Thư mục lưu các file: {rel}")
+        
+        cols = st.columns(min(len(res["files"]), 4))
+        for i, path in enumerate(res["files"]):
+            if os.path.exists(path):
+                with open(path, "rb") as fh: data = fh.read()
+                mime = XLSX_MIME if path.endswith(".xlsx") else "application/json"
+                cols[i % 4].download_button(f"⬇️ Tải {os.path.basename(path)}", data, file_name=os.path.basename(path), mime=mime, key=f"orders_dl_{os.path.basename(path)}_{i}")
 
 # ============================================================================
-# 🗺️ TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT
+# 🗺️ TAB 5: ĐỊNH TUYẾN CLARKE-WRIGHT
 # ============================================================================
 OC_DEFAULTS = {
     "saving_1_price": 800_000.0, "saving_2_price": 300_000.0,
@@ -780,7 +812,6 @@ def evaluate_transportation_constraints(route_or_order, df_vehicles, vehicle_ava
     if total_w > 1.5 * max_fleet_w or total_v > 1.5 * max_fleet_v or total_w > sum_fleet_w or total_v > sum_fleet_v:
         return outsourced("OUTSOURCE_FULL", _full_cls(total_w, total_v, oc, f"hàng quá khủng vượt 150% xe lớn nhất nhà ({max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³)"),
                         f"🚨 Hàng quá khủng (vượt >150% xe lớn nhất nhà {max_fleet_w:,.0f}kg/{max_fleet_v:.1f}m³) -> Thuê ngoài 3PL Full ngay lập tức.")
-
     if total_w > max_fleet_w or total_v > max_fleet_v:
         if avail.empty:
             return outsourced("OUTSOURCE_NO_VEHICLE_AVAILABLE", classify_outsourcing(total_w, total_v, oc),
@@ -849,7 +880,6 @@ class Config:
     vehicle_file: str = os.path.join(OUT_FLEET, "DIM_VEHICLE.xlsx")
     warehouse_file: str = os.path.join(OUT_WAREHOUSE, "WAREHOUSE_WITH_COORDINATES.xlsx")
     product_file: str = os.path.join(OUT_PRODUCT, "DIM_PRODUCT.xlsx")
-    driver_file: str = os.path.join(OUT_DRIVER, "DIM_DRIVER.xlsx")
     order_file: str = os.path.join(OUT_ORDERS, "DIM_ORDERS.xlsx")
     cust_file: str = os.path.join(OUT_CUSTOMER, "DATASET_CUSTOMER.xlsx")
     matrix_file: str = os.path.join(OUT_MATRIX, "DISTANCE_MATRIX_KM.xlsx")
@@ -916,47 +946,6 @@ def load_customers(cfg: Config) -> dict:
             out[cid] = {"lat": float(r["lat"]), "lng": float(r["lng"]), "name": "" if is_blank(r.get("customer_name")) else str(r["customer_name"])}
     return out
 
-def load_drivers_raw(cfg: Config) -> list:
-    drivers = []
-    if os.path.exists(cfg.driver_file):
-        try:
-            df = read_dim_file(cfg.driver_file)
-            for _, r in df.iterrows():
-                did = str(r.get("driver_id", "")).strip()
-                dname = str(r.get("driver_name", "")).strip()
-                if not did or not dname or did in ("nan", "None"): continue
-                lic = str(r.get("license_type", "C")).strip().upper()
-                lic = lic if lic in LICENSE_RANKS else "C"
-                wid = str(r.get("id_warehouse", "")).strip()
-                role = str(r.get("role", "Tài xế chính")).strip()
-                drivers.append({"driver_id": did, "driver_name": dname, "license_type": lic, "id_warehouse": wid, "role": role})
-            if drivers: return drivers
-        except Exception: pass
-
-    raw_state = st.session_state.get("driver_raw")
-    if raw_state is not None and len(raw_state) > 0:
-        for _, r in raw_state.iterrows():
-            did = str(r.get("driver_id", "")).strip()
-            dname = str(r.get("driver_name", "")).strip()
-            if not did or not dname or did in ("nan", "None"): continue
-            lic = str(r.get("license_type", "C")).strip().upper()
-            lic = lic if lic in LICENSE_RANKS else "C"
-            wid = str(r.get("id_warehouse", "")).strip()
-            role = str(r.get("role", "Tài xế chính")).strip()
-            drivers.append({"driver_id": did, "driver_name": dname, "license_type": lic, "id_warehouse": wid, "role": role})
-            
-    return drivers
-
-def load_drivers(cfg: Config) -> dict:
-    out = {}
-    for r in load_drivers_raw(cfg):
-        wid = r["id_warehouse"]
-        name = r["driver_name"]
-        role = norm_basic(r["role"])
-        kind = "phụ" if any(k in role for k in ("phu", "assist", "helper")) else "chính"
-        out.setdefault(wid, {"chính": [], "phụ": []})[kind].append(name)
-    return out
-
 def load_orders(cfg: Config, notes: list) -> list:
     df = read_dim_file(cfg.order_file)
     for c in ("order_id", "customer_id", "order_date"):
@@ -997,7 +986,7 @@ def load_data(cfg: Config) -> dict:
     warehouses = {w: {"lat": la, "lng": lo, "name": w} for w, (la, lo) in wh_coords.items()}
     orphan = sorted(set(veh["id_warehouse"]) - set(warehouses))
     if orphan: notes.append(f"Xe thuộc kho không có tọa độ: {', '.join(orphan)}.")
-    return {"vehicles": veh, "drivers": load_drivers(cfg), "drivers_raw": load_drivers_raw(cfg),
+    return {"vehicles": veh,
             "dist": read_matrix(cfg.matrix_file) if os.path.exists(cfg.matrix_file) else pd.DataFrame(), 
             "cust": load_customers(cfg), "warehouses": warehouses, "orders": load_orders(cfg, notes), "notes": notes}
 
@@ -1012,7 +1001,6 @@ class RoutePlanner:
     def __init__(self, data: dict, cfg: Config = CFG):
         self.cfg = cfg
         self.veh = data["vehicles"]
-        self.drivers = data["drivers"]
         self.cust = data["cust"]
         self.wh = data["warehouses"]
         self.detour = cfg.detour_factor
@@ -1203,7 +1191,7 @@ class RoutePlanner:
             "start": start, "end": start + dt.timedelta(hours=hours), "hours": hours, "events": events,
         }
 
-    def _dispatch(self, route, wh_id, demand, by_cust, veh_counts, assign_driver, date_str, veh_free=None):
+    def _dispatch(self, route, wh_id, demand, by_cust, veh_counts, date_str, veh_free=None):
         cfg, oc = self.cfg, self.cfg.outsourcing
         veh_free = {} if veh_free is None else veh_free
         rules = service_rules_from_cfg(cfg)
@@ -1257,7 +1245,7 @@ class RoutePlanner:
                 out.append(self._outsource_route(r, wh_id, demand, by_cust, ta["cls"], ev, date_str, reason=why))
             else:
                 split = action == "MAX_VEHICLE_PLUS_OUTSOURCE"
-                primary, assistant, backup = assign_driver(wh_id)
+                primary, assistant, backup = "Chờ phân công", "—", False
                 start, hours = self._start(date_str, start_str), tb["total_hours"]
                 cap_w, cap_v = float(vrow["max_weight_kg"]), float(vrow["max_volume_m3"])
                 ev, reason = [], ""
@@ -1327,16 +1315,6 @@ class RoutePlanner:
         
         veh_counts = {vid: cfg.vehicle_daily_count for vid in self.veh["vehicle_id"]}
         veh_free = {}
-        driver_pointers = {w: {"c": 0, "p": 0} for w in self.wh}
-        def assign_driver(wh_id):
-            d_info = self.drivers.get(wh_id, {"chính": ["Tài xế chính"], "phụ": ["Phụ xe"]})
-            c_list, p_list = d_info["chính"], d_info["phụ"]
-            idx_c, idx_p = driver_pointers[wh_id]["c"], driver_pointers[wh_id]["p"]
-            if idx_c < len(c_list): primary, backup = c_list[idx_c], False; driver_pointers[wh_id]["c"] += 1
-            else: primary, backup = "Tài xế Dự Phòng (Thuê ngoài)", True
-            assistant = p_list[idx_p % len(p_list)] if p_list else "Phụ xe"
-            driver_pointers[wh_id]["p"] += 1
-            return primary, assistant, backup
             
         by_wh = {}
         for o in placed: by_wh.setdefault(self.nearest_wh(o["customer_id"]), []).append(o)
@@ -1345,7 +1323,7 @@ class RoutePlanner:
             routes = self.clarke_wright(list(demand), wh_id, demand)
             routes.sort(key=lambda rt: self._priority(rt, wh_id, demand))
             for rt in routes:
-                for r in self._dispatch(rt, wh_id, demand, by_cust, veh_counts, assign_driver, date_str, veh_free):
+                for r in self._dispatch(rt, wh_id, demand, by_cust, veh_counts, date_str, veh_free):
                     log(r); res["routes"].append(r)
                     
         res["unrouted_orders"] = unplaced
@@ -1383,15 +1361,14 @@ def route_total(r):
     return r["fixed_cost"] + r["variable_cost"] + r["overnight_cost"] + r.get("driver_cost", 0) + r.get("outsourcing_cost", 0)
 
 # ============================================================================
-# PIPELINE TIỆN ÍCH & RENDER UI TAB 6
+# PIPELINE TIỆN ÍCH & RENDER UI TAB 5
 # ============================================================================
 def file_status(cfg: Config) -> pd.DataFrame:
     items = [
         ("Tab 1 · Hạm đội xe", cfg.vehicle_file, "Bắt buộc"),
         ("Tab 2 · Kho & Tọa độ", cfg.warehouse_file, "Khuyến nghị"),
         ("Tab 3 · Sản phẩm", cfg.product_file, "Tuỳ chọn"),
-        ("Tab 4 · Tài xế", cfg.driver_file, "Bắt buộc"),
-        ("Tab 5 · Đơn hàng (Đã geocode)", cfg.order_file, "Bắt buộc"),
+        ("Tab 4 · Đơn hàng (Đã geocode)", cfg.order_file, "Bắt buộc"),
     ]
     rows = [{"Nguồn": n, "File": os.path.relpath(p, BASE_DIR), "Trạng thái": "✅ Có" if os.path.exists(p) else "❌ Chưa có", "Yêu cầu": need}
             for n, p, need in items]
@@ -1399,9 +1376,8 @@ def file_status(cfg: Config) -> pd.DataFrame:
 
 def require_files(cfg: Config, which):
     labels = {
-        "orders": (cfg.order_file, "Tab 5 (Đơn hàng)"),
+        "orders": (cfg.order_file, "Tab 4 (Đơn hàng)"),
         "fleet": (cfg.vehicle_file, "Tab 1 (Hạm đội xe)"),
-        "driver": (cfg.driver_file, "Tab 4 (Tài xế)"),
     }
     missing = [f"`{os.path.relpath(labels[k][0], BASE_DIR)}` (chạy {labels[k][1]})" for k in which if not os.path.exists(labels[k][0])]
     if missing: raise UserError("Thiếu file đầu vào: " + "; ".join(missing))
@@ -1544,7 +1520,7 @@ def render_routing_tab():
     st.dataframe(file_status(cfg), hide_index=True)
     
     if st.button("⚡ Chạy Routing Tạm Thời", type="primary", key="t6_run_temp"):
-        require_files(cfg, ["orders", "fleet", "driver"])
+        require_files(cfg, ["orders", "fleet"])
         data = load_data(cfg)
         planner, days, kpis, total_cost = simulate_all(data, cfg)
         st.session_state["t6_temp_plan"] = {"planner": planner, "days": days, "kpis": kpis, "cfg": cfg, "data": data}
@@ -1767,9 +1743,8 @@ def render_routing_tab():
         st.dataframe(final_rdf, hide_index=True)
 
 # ============================================================================
-# 🚨 TAB 7: ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ (INCIDENT CONTROL CENTER)
+# 🚨 TAB 6: ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ (INCIDENT CONTROL CENTER)
 # ============================================================================
-# --- KHO SOLVER FUNCTIONS CHO 39 TÌNH HUỐNG ---
 def handle_road_blocked(order_id):
     return f"[{dt.datetime.now():%H:%M:%S}] 🗺️ [RE-ROUTING] Đường chặn hoàn toàn. OSRM API đã vẽ lộ trình mới né điểm sạt lở cho đơn `{order_id}` (+2.4km)."
 
@@ -1934,17 +1909,15 @@ INCIDENT_SOLVERS = {
 }
 
 def render_incident_tab():
-    st.header("🚨 7. TRUNG TÂM ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ")
-    st.caption("🌐 *Liên kết trực tiếp với dữ liệu Đơn hàng (Tab 5), Hạm đội xe (Tab 1) & Tài xế (Tab 4)*")
+    st.header("🚨 6. TRUNG TÂM ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ")
+    st.caption("🌐 *Liên kết trực tiếp với dữ liệu Đơn hàng (Tab 4) & Hạm đội xe (Tab 1)*")
     
-    # Lấy danh sách Order/Vehicle/Driver động từ dữ liệu đã upload ở các Tab
     orders_res = st.session_state.get("orders_result")
     fleet_res = st.session_state.get("fleet_result")
-    driver_res = st.session_state.get("driver_result")
     
     order_options = orders_res["df"]["order_id"].tolist() if orders_res else ["ORD_003", "ORD_001", "ORD_002"]
     vehicle_options = fleet_res["df"]["vehicle_id"].tolist() if fleet_res else ["VEH_06", "VEH_01", "VEH_02"]
-    driver_options = driver_res["df"]["driver_id"].tolist() if driver_res else ["DRV_06", "DRV_01", "DRV_02"]
+    driver_options = ["DRV_06", "DRV_01", "DRV_02", "Tài xế dự phòng"]
 
     if "live_logs" not in st.session_state:
         st.session_state["live_logs"] = [
@@ -1955,9 +1928,6 @@ def render_incident_tab():
         
     col_solver, col_form = st.tabs(["🛠️ 1. Kích Hoạt Python Incident Solvers", "📡 2. Báo Cáo Thực Địa & Live Tracking Logs"])
     
-    # ------------------------------------------------------------------------
-    # SUB-TAB 1: 39 PYTHON SOLVERS
-    # ------------------------------------------------------------------------
     with col_solver:
         st.markdown("### ⚡ Kích Hoạt Tự Động Giải Quyết Sự Cố Thực Địa")
         c1, c2 = st.columns([1.2, 2])
@@ -1987,7 +1957,6 @@ def render_incident_tab():
                 solver_tuple = INCIDENT_SOLVERS[sel_incident_key]
                 func = solver_tuple[1]
                 
-                # Gọi hàm với tham số phù hợp
                 try:
                     res_msg = func(sel_order, sel_vehicle, sel_driver)
                 except TypeError:
@@ -1998,7 +1967,6 @@ def render_incident_tab():
                         
                 console_placeholder.code(res_msg, language="markdown")
                 
-                # Cập nhật tự động vào Live Logs
                 new_log = {
                     "Thời gian": f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}",
                     "Mã Xe": sel_vehicle,
@@ -2013,9 +1981,6 @@ def render_incident_tab():
             else:
                 console_placeholder.info("👈 Chọn loại sự cố bên trái và nhấn nút 'Run Python Solver' để xem kết quả xử lý tự động.")
 
-    # ------------------------------------------------------------------------
-    # SUB-TAB 2: BÁO CÁO THỰC ĐỊA & LIVE LOGS
-    # ------------------------------------------------------------------------
     with col_form:
         st.markdown("### ✍️ Biểu Mẫu Nhập Báo Cáo Thực Địa Từ Tài Xế / Nhân Viên")
         
@@ -2056,10 +2021,9 @@ TAB_NAMES = [
     "🚚 1. Fleet",
     "🏭 2. Warehouse",
     "📦 3. Product",
-    "👨‍✈️ 4. Driver",
-    "🧾 5. Orders",
-    "🗺️ 6. Routing",
-    "🚨 7. Xử Lý Sự Cố"
+    "🧾 4. Orders",
+    "🗺️ 5. Routing",
+    "🚨 6. Xử Lý Sự Cố"
 ]
 
 def main():
@@ -2076,10 +2040,9 @@ def main():
     with tabs[0]: render_fleet_tab()
     with tabs[1]: render_warehouse_tab()
     with tabs[2]: render_product_tab()
-    with tabs[3]: render_driver_tab()
-    with tabs[4]: render_orders_tab()
-    with tabs[5]: render_routing_tab()
-    with tabs[6]: render_incident_tab()
+    with tabs[3]: render_orders_tab()
+    with tabs[4]: render_routing_tab()
+    with tabs[5]: render_incident_tab()
 
 if __name__ == "__main__":
     main()
