@@ -474,7 +474,7 @@ def render_warehouse_tab():
         st.map(res["df"].dropna(subset=["lat", "lng"]).rename(columns={"lng": "lon"})[["lat", "lon"]])
 
 # ============================================================================
-# 📦 TAB 3: PRODUCT (ĐÃ THÊM DÀI x RỘNG x CAO CM)
+# 📦 TAB 3: PRODUCT (HIỂN THỊ & XUẤT RÕ LENGTH, WIDTH, HEIGHT)
 # ============================================================================
 PRODUCT_FIELDS = {
     "product_id": ["mã sản phẩm", "product id", "sku", "item code", "mã sp", "code", "id"],
@@ -492,6 +492,11 @@ PRODUCT_NUMERIC = ["length_cm", "width_cm", "height_cm", "volume", "weight", "co
 def process_product(rec):
     out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["product_id", "product_name"]}
     for f in PRODUCT_NUMERIC: out[f] = parse_num(rec.get(f))
+    
+    # Tự động tính volume (m3) nếu người dùng nhập Dài, Rộng, Cao mà chưa có Volume
+    if out["volume"] == 0.0 and out["length_cm"] > 0 and out["width_cm"] > 0 and out["height_cm"] > 0:
+        out["volume"] = round((out["length_cm"] * out["width_cm"] * out["height_cm"]) / 1_000_000.0, 6)
+        
     out["trạng_thái"] = "✅ Hợp lệ"
     return out
 
@@ -514,6 +519,7 @@ def render_product_tab():
         "length_cm": [120.0, 150.0],
         "width_cm": [80.0, 60.0],
         "height_cm": [90.0, 200.0],
+        "volume": [0.864, 1.8],
         "weight": [25.0, 50.0], 
         "selling_price": [2500000, 4500000]
     })
@@ -523,12 +529,18 @@ def render_product_tab():
     raw = st.session_state.get("product_raw")
     if raw is None: return
     chosen = render_mapping("product", list(PRODUCT_FIELDS), raw)
-    if st.button("🚀 Chuẩn hóa Sản phẩm", key="product_process", type="primary"):
+    if st.button("🚀 Chuẩn hóa Sản phẩm & Xuất File DIM_PRODUCT", key="product_process", type="primary"):
         colmap = build_colmap(raw, chosen)
         rows = [process_product({f: pick(r, colmap, f, None) for f in PRODUCT_FIELDS}) for _, r in raw.iterrows()]
         out = product_validate_output(pd.DataFrame(rows))
+        
+        # Đảm bảo các cột length_cm, width_cm, height_cm xuất hiện đầy đủ trong file xuất ra
+        ordered_cols = ["product_id", "product_name", "length_cm", "width_cm", "height_cm", "volume", "weight", "cost_price", "selling_price", "trạng_thái", "kiểm_tra"]
+        final_cols = [c for c in ordered_cols if c in out.columns] + [c for c in out.columns if c not in ordered_cols]
+        out = out[final_cols]
+        
         files = save_outputs(OUT_PRODUCT, "DIM_PRODUCT", "DIM_PRODUCT", out)
-        store_result("product", out, files, "🧭 Hoàn tất chuẩn hóa sản phẩm", [("Tổng sản phẩm", len(out))])
+        store_result("product", out, files, "🧭 Hoàn tất chuẩn hóa sản phẩm (Đã lưu Length, Width, Height)", [("Tổng sản phẩm", len(out))])
     render_result("product", "📊 Kết quả Sản phẩm")
 
 # ============================================================================
@@ -737,7 +749,7 @@ def render_orders_tab():
                 cols[i % 4].download_button(f"⬇️ Tải {os.path.basename(path)}", data, file_name=os.path.basename(path), mime=mime, key=f"orders_dl_{os.path.basename(path)}_{i}")
 
 # ============================================================================
-# 📦 TAB 5: ORDERS SOLVING (LEVEL UP VERSION)
+# 📦 TAB 5: ORDERS SOLVING (LẤY LENGTH, WIDTH, HEIGHT TỪ DIM_PRODUCT.XLSX)
 # ============================================================================
 PROVINCE_KEYWORDS = [
     "Hà Nội", "Hồ Chí Minh", "Đà Nẵng", "Hải Phòng", "Cần Thơ", "An Giang", "Bà Rịa - Vũng Tàu",
@@ -766,10 +778,9 @@ def extract_province(address_str: str) -> str:
 
 def render_orders_solving_tab():
     st.header("⚡ 5. Orders Solving (Level Up Orders Analysis)")
-    st.caption("🌐 *Kết hợp tra cứu kích thước từ Tab 3 (Product) để phân loại hàng BBS (A/B) và thống kê theo Tỉnh/Thành*")
+    st.caption("🌐 *Tra cứu trực tiếp Dài (length_cm), Rộng (width_cm), Cao (height_cm) từ DIM_PRODUCT.xlsx để tính Volumetric Weight & BBS*")
     
     orders_res = st.session_state.get("orders_result")
-    product_res = st.session_state.get("product_result")
     
     if orders_res is None or orders_res.get("df") is None or orders_res["df"].empty:
         st.warning("⚠️ Chưa có dữ liệu Đơn hàng từ Tab 4 (Orders). Vui lòng thực hiện chuẩn hóa ở Tab 4 trước.")
@@ -777,30 +788,36 @@ def render_orders_solving_tab():
         
     df_orders = orders_res["df"].copy()
     
-    if product_res is not None and product_res.get("df") is not None and not product_res["df"].empty:
-        df_product = product_res["df"].copy()
-    else:
-        df_product = pd.DataFrame()
-        st.info("💡 Chưa có danh mục sản phẩm ở Tab 3. Hệ thống sẽ sử dụng kích thước mặc định (30cm x 20cm x 15cm).")
-
+    # Đọc dữ liệu từ file DIM_PRODUCT.xlsx đã lưu ở Tab 3
+    product_file_path = os.path.join(OUT_PRODUCT, "DIM_PRODUCT.xlsx")
     prod_map = {}
-    if not df_product.empty:
-        for _, p_row in df_product.iterrows():
-            p_id = str(p_row.get("product_id", "")).strip()
-            p_name = str(p_row.get("product_name", "")).strip()
-            l = parse_num(p_row.get("length_cm")) or 30.0
-            w = parse_num(p_row.get("width_cm")) or 20.0
-            h = parse_num(p_row.get("height_cm")) or 15.0
-            
-            dim_info = {"l": l, "w": w, "h": h}
-            if p_id: prod_map[norm_basic(p_id)] = dim_info
-            if p_name: prod_map[norm_basic(p_name)] = dim_info
+    
+    if os.path.exists(product_file_path):
+        try:
+            df_product = pd.read_excel(product_file_path)
+            for _, p_row in df_product.iterrows():
+                p_id = str(p_row.get("product_id", "")).strip()
+                p_name = str(p_row.get("product_name", "")).strip()
+                
+                l = parse_num(p_row.get("length_cm")) or 30.0
+                w = parse_num(p_row.get("width_cm")) or 20.0
+                h = parse_num(p_row.get("height_cm")) or 15.0
+                
+                dim_info = {"l": l, "w": w, "h": h}
+                if p_id: prod_map[norm_basic(p_id)] = dim_info
+                if p_name: prod_map[norm_basic(p_name)] = dim_info
+            st.success(f"✅ Đã kết nối thành công tới file `{os.path.relpath(product_file_path, BASE_DIR)}` ({len(df_product)} sản phẩm).")
+        except Exception as exc:
+            st.error(f"❌ Lỗi khi đọc file DIM_PRODUCT.xlsx: {exc}")
+    else:
+        st.info("💡 Chưa tìm thấy file DIM_PRODUCT.xlsx ở Tab 3. Hệ thống sẽ áp dụng kích thước mặc định (30cm x 20cm x 15cm).")
 
     solved_rows = []
     for _, o_row in df_orders.iterrows():
         item_str = str(o_row.get("items", "")).strip()
         item_norm = norm_basic(item_str)
         
+        # Tra cứu 3 thông số Dài, Rộng, Cao từ DIM_PRODUCT.xlsx
         dim = prod_map.get(item_norm, {"l": 30.0, "w": 20.0, "h": 15.0})
         l, w, h = dim["l"], dim["w"], dim["h"]
         
@@ -823,6 +840,9 @@ def render_orders_solving_tab():
         row_dict = o_row.to_dict()
         row_dict.update({
             "Tỉnh_Thành": province,
+            "Chiều_Dài_cm": l,
+            "Chiều_Rộng_cm": w,
+            "Chiều_Cao_cm": h,
             "Kích_Thước_DxRxC_cm": f"{l:.0f} x {w:.0f} x {h:.0f}",
             "Volumetric_Weight_kg": round(volumetric_weight, 3),
             "BBS": bbs_code,
@@ -865,7 +885,7 @@ def render_orders_solving_tab():
         st.bar_chart(province_summary.set_index("Tỉnh_Thành")[["Đơn_A_Cam", "Đơn_B_Xám"]])
 
     with t_detail:
-        st.markdown("##### 📋 Toàn bộ bảng dữ liệu Đơn hàng đã nâng cấp (Cột BBS được đánh dấu A/B)")
+        st.markdown("##### 📋 Toàn bộ bảng dữ liệu Đơn hàng đã nâng cấp (Hiển thị Dài, Rộng, Cao & Tô màu BBS)")
         
         filter_bbs = st.multiselect("Bộ lọc loại BBS:", ["A", "B"], default=["A", "B"], key="filter_bbs_sel")
         df_display = df_solved[df_solved["BBS"].isin(filter_bbs)].copy()
@@ -880,11 +900,11 @@ def render_orders_solving_tab():
         styled_df = df_display.style.map(highlight_bbs, subset=["BBS"])
         st.dataframe(styled_df, use_container_width=True)
 
-    # 3. Xuất file
+    # 3. Xuất file kết quả
     files = save_outputs(OUT_SOLVING, "DIM_ORDERS_SOLVED", "DIM_ORDERS_SOLVED", df_solved, extra_sheets={"THONG_KE_TINH": province_summary})
     
     st.divider()
-    st.info(f"📁 Báo cáo đã được tự động lưu tại: `{os.path.relpath(files[0], BASE_DIR)}`")
+    st.info(f"📁 Báo cáo Level-Up đã được tự động lưu tại: `{os.path.relpath(files[0], BASE_DIR)}`")
     with open(files[0], "rb") as fh:
         st.download_button("⬇️ Tải Báo Cáo DIM_ORDERS_SOLVED.xlsx", fh.read(), file_name="DIM_ORDERS_SOLVED.xlsx", mime=XLSX_MIME, key="dl_orders_solved")
 
