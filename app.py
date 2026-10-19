@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import math
 import time
 import datetime as dt
 import numpy as np
@@ -30,9 +31,9 @@ OUT_PRODUCT = os.path.join(BASE_DIR, "output_product")
 OUT_ORDERS = os.path.join(BASE_DIR, "output_orders")
 OUT_CUSTOMER = os.path.join(BASE_DIR, "output_customer")
 OUT_SOLVING = os.path.join(BASE_DIR, "output_solving")
+OUT_ROUTING = os.path.join(BASE_DIR, "output_routing")
 
-class UserError(Exception):
-    pass
+class UserError(Exception): pass
 
 def is_blank(v):
     if v is None: return True
@@ -111,6 +112,13 @@ def parse_date_iso(dstr: str) -> str:
         if pd.notna(parsed): return parsed.strftime("%Y-%m-%d")
     except Exception: pass
     return ""
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def _read_csv_bytes(data: bytes) -> pd.DataFrame:
     for enc in ("utf-8-sig", "cp1258", "latin-1"):
@@ -474,7 +482,7 @@ def render_warehouse_tab():
         st.map(res["df"].dropna(subset=["lat", "lng"]).rename(columns={"lng": "lon"})[["lat", "lon"]])
 
 # ============================================================================
-# 📦 TAB 3: PRODUCT (HIỂN THỊ & XUẤT RÕ LENGTH, WIDTH, HEIGHT)
+# 📦 TAB 3: PRODUCT
 # ============================================================================
 PRODUCT_FIELDS = {
     "product_id": ["mã sản phẩm", "product id", "sku", "item code", "mã sp", "code", "id"],
@@ -492,11 +500,8 @@ PRODUCT_NUMERIC = ["length_cm", "width_cm", "height_cm", "volume", "weight", "co
 def process_product(rec):
     out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["product_id", "product_name"]}
     for f in PRODUCT_NUMERIC: out[f] = parse_num(rec.get(f))
-    
-    # Tự động tính volume (m3) nếu người dùng nhập Dài, Rộng, Cao mà chưa có Volume
     if out["volume"] == 0.0 and out["length_cm"] > 0 and out["width_cm"] > 0 and out["height_cm"] > 0:
         out["volume"] = round((out["length_cm"] * out["width_cm"] * out["height_cm"]) / 1_000_000.0, 6)
-        
     out["trạng_thái"] = "✅ Hợp lệ"
     return out
 
@@ -533,12 +538,9 @@ def render_product_tab():
         colmap = build_colmap(raw, chosen)
         rows = [process_product({f: pick(r, colmap, f, None) for f in PRODUCT_FIELDS}) for _, r in raw.iterrows()]
         out = product_validate_output(pd.DataFrame(rows))
-        
-        # Đảm bảo các cột length_cm, width_cm, height_cm xuất hiện đầy đủ trong file xuất ra
         ordered_cols = ["product_id", "product_name", "length_cm", "width_cm", "height_cm", "volume", "weight", "cost_price", "selling_price", "trạng_thái", "kiểm_tra"]
         final_cols = [c for c in ordered_cols if c in out.columns] + [c for c in out.columns if c not in ordered_cols]
         out = out[final_cols]
-        
         files = save_outputs(OUT_PRODUCT, "DIM_PRODUCT", "DIM_PRODUCT", out)
         store_result("product", out, files, "🧭 Hoàn tất chuẩn hóa sản phẩm (Đã lưu Length, Width, Height)", [("Tổng sản phẩm", len(out))])
     render_result("product", "📊 Kết quả Sản phẩm")
@@ -592,25 +594,20 @@ def process_order_with_geocode(raw, do_geocode=True):
     cust_name = r_name or "Khách lẻ"
     t_type = match_label(raw.get("order_type", ""), TYPE_LK) or ("B2B" if "cong ty" in norm_basic(r_name) else "B2C")
     t_alert = match_label(raw.get("alert_status", ""), ALERT_LK) or "Normal"
-    
     q = parse_qty(raw.get("quantity"))
     w = parse_qty(raw.get("total_weight_kg"))
     v = parse_qty(raw.get("total_volume_m3"), dot_is_decimal=True)
-    
     addr = str(raw.get("address", "")).strip()
     cleaned_addr = clean_address(addr)
     lat, lng, geo_status = None, None, "— Chưa quét"
-    
     if do_geocode and cleaned_addr:
         geo = geocode_address(cleaned_addr)
         if geo["ok"]:
             lat, lng, geo_status = geo["lat"], geo["lng"], "✅ Thành công"
         else:
             geo_status = geo["status"]
-            
     items_str = str(raw.get("items", "")).strip()
-    if not items_str or items_str == "nan":
-        items_str = "Hàng tiêu chuẩn"
+    if not items_str or items_str == "nan": items_str = "Hàng tiêu chuẩn"
 
     return {
         "order_id": str(raw.get("order_id", "")),
@@ -663,93 +660,38 @@ def render_orders_tab():
             for _, row in raw.iterrows():
                 rows.append(process_order_with_geocode({f: row.get(c) for f, c in colmap.items()}, do_geocode=do_geo))
         out = orders_validate_output(pd.DataFrame(rows))
-        
-        # 1. Lưu file tổng chuẩn DIM_ORDERS
         files = save_outputs(OUT_ORDERS, "DIM_ORDERS", "DIM_ORDERS", out)
-        
-        # 2. Phân tách thành 3 bảng với cấu trúc y hệt bảng gốc
         mask_failed = out["trạng_thái_geocode"] != "✅ Thành công"
         df_failed = out[mask_failed].copy().reset_index(drop=True)
-        
         df_success = out[~mask_failed].copy()
         mask_hanoi = df_success["address"].apply(is_hanoi_address)
         df_hanoi = df_success[mask_hanoi].copy().reset_index(drop=True)
         df_outside = df_success[~mask_hanoi].copy().reset_index(drop=True)
-        
-        # Lưu các file phụ trợ
         file_hn = save_outputs(OUT_ORDERS, "DIM_ORDERS_HA_NOI", "DIM_ORDERS_HA_NOI", df_hanoi)
         file_out = save_outputs(OUT_ORDERS, "DIM_ORDERS_OUTSIDE_HN", "DIM_ORDERS_OUTSIDE_HN", df_outside)
         file_err = save_outputs(OUT_ORDERS, "DIM_ORDERS_FAILED", "DIM_ORDERS_FAILED", df_failed)
-        
         files.extend([file_hn[0], file_out[0], file_err[0]])
-        
-        # Lưu thông tin Customer
         cust_df = out.dropna(subset=["lat", "lng"])[["customer_id", "customer_name", "address", "lat", "lng", "trạng_thái_geocode"]].drop_duplicates(subset=["customer_id"])
         save_outputs(OUT_CUSTOMER, "DATASET_CUSTOMER", "DATASET_CUSTOMER", cust_df)
-        
-        extra = {
-            "df_hanoi": optimize_dtypes(df_hanoi, categorize=True),
-            "df_outside": optimize_dtypes(df_outside, categorize=True),
-            "df_failed": optimize_dtypes(df_failed, categorize=True),
-        }
-        
-        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa & phân loại đơn hàng", [
-            ("Tổng số đơn", len(out)),
-            ("Đơn Hà Nội", len(df_hanoi)),
-            ("Đơn Ngoài Hà Nội", len(df_outside)),
-            ("Lỗi Geocode", len(df_failed))
-        ], extra=extra)
-        
+        extra = {"df_hanoi": optimize_dtypes(df_hanoi, categorize=True), "df_outside": optimize_dtypes(df_outside, categorize=True), "df_failed": optimize_dtypes(df_failed, categorize=True)}
+        store_result("orders", out, files, "🧭 Hoàn tất chuẩn hóa & phân loại đơn hàng", [("Tổng số đơn", len(out)), ("Đơn Hà Nội", len(df_hanoi)), ("Đơn Ngoài Hà Nội", len(df_outside)), ("Lỗi Geocode", len(df_failed))], extra=extra)
     res = st.session_state.get("orders_result")
     if res is not None:
         st.markdown("### 📊 Kết quả Phân Loại Đơn Hàng")
         st.success(res["summary"])
-        
         if res["metrics"]:
             cols = st.columns(len(res["metrics"]))
             for c, (lab, val) in zip(cols, res["metrics"]): c.metric(lab, val)
-            
         extra = res.get("extra", {})
-        df_hn = extra.get("df_hanoi", pd.DataFrame())
-        df_out = extra.get("df_outside", pd.DataFrame())
-        df_fail = extra.get("df_failed", pd.DataFrame())
-        
-        t_hn, t_out, t_fail, t_all = st.tabs([
-            f"🏢 1. Đơn tại Hà Nội ({len(df_hn)})",
-            f"🌏 2. Đơn ngoài Hà Nội ({len(df_out)})",
-            f"⚠️ 3. Không quét được tọa độ ({len(df_fail)})",
-            f"📋 4. Tất cả đơn tổng ({len(res['df'])})"
-        ])
-        
-        with t_hn:
-            st.markdown("##### 🏢 Danh sách các đơn hàng thuộc khu vực Hà Nội")
-            st.dataframe(df_hn, use_container_width=True)
-            
-        with t_out:
-            st.markdown("##### 🌏 Danh sách các đơn hàng ngoài khu vực Hà Nội")
-            st.dataframe(df_out, use_container_width=True)
-            
-        with t_fail:
-            st.markdown("##### ⚠️ Danh sách các đơn hàng không quét được tọa độ")
-            st.dataframe(df_fail, use_container_width=True)
-            
-        with t_all:
-            st.markdown("##### 📋 Bảng tổng hợp tất cả đơn hàng")
-            st.dataframe(res["df"], use_container_width=True)
-
-        st.caption(f"🧠 RAM kết quả: {mem_kb(res['df']):,.1f} KB")
-        rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
-        st.info(f"📁 Thư mục lưu các file: {rel}")
-        
-        cols = st.columns(min(len(res["files"]), 4))
-        for i, path in enumerate(res["files"]):
-            if os.path.exists(path):
-                with open(path, "rb") as fh: data = fh.read()
-                mime = XLSX_MIME if path.endswith(".xlsx") else "application/json"
-                cols[i % 4].download_button(f"⬇️ Tải {os.path.basename(path)}", data, file_name=os.path.basename(path), mime=mime, key=f"orders_dl_{os.path.basename(path)}_{i}")
+        df_hn, df_out, df_fail = extra.get("df_hanoi", pd.DataFrame()), extra.get("df_outside", pd.DataFrame()), extra.get("df_failed", pd.DataFrame())
+        t_hn, t_out, t_fail, t_all = st.tabs([f"🏢 1. Đơn tại Hà Nội ({len(df_hn)})", f"🌏 2. Đơn ngoài Hà Nội ({len(df_out)})", f"⚠️ 3. Không quét được tọa độ ({len(df_fail)})", f"📋 4. Tất cả đơn tổng ({len(res['df'])})"])
+        with t_hn: st.dataframe(df_hn, use_container_width=True)
+        with t_out: st.dataframe(df_out, use_container_width=True)
+        with t_fail: st.dataframe(df_fail, use_container_width=True)
+        with t_all: st.dataframe(res["df"], use_container_width=True)
 
 # ============================================================================
-# 📦 TAB 5: ORDERS SOLVING (LẤY LENGTH, WIDTH, HEIGHT TỪ DIM_PRODUCT.XLSX)
+# 📦 TAB 5: ORDERS SOLVING
 # ============================================================================
 PROVINCE_KEYWORDS = [
     "Hà Nội", "Hồ Chí Minh", "Đà Nẵng", "Hải Phòng", "Cần Thơ", "An Giang", "Bà Rịa - Vũng Tàu",
@@ -767,146 +709,255 @@ def extract_province(address_str: str) -> str:
     if is_blank(address_str): return "Không xác định"
     norm_addr = norm_basic(address_str)
     for p in PROVINCE_KEYWORDS:
-        if norm_basic(p) in norm_addr:
-            return p
+        if norm_basic(p) in norm_addr: return p
     parts = [part.strip() for part in address_str.split(",") if part.strip()]
     if parts:
-        last = parts[-1]
-        last = re.sub(r"(Việt Nam|Vietnam)\$", "", last, flags=re.I).strip()
+        last = re.sub(r"(Việt Nam|Vietnam)\$", "", parts[-1], flags=re.I).strip()
         if last: return last
     return "Chưa rõ Tỉnh/Thành"
 
 def render_orders_solving_tab():
     st.header("⚡ 5. Orders Solving (Level Up Orders Analysis)")
-    st.caption("🌐 *Tra cứu trực tiếp Dài (length_cm), Rộng (width_cm), Cao (height_cm) từ DIM_PRODUCT.xlsx để tính Volumetric Weight & BBS*")
-    
     orders_res = st.session_state.get("orders_result")
-    
     if orders_res is None or orders_res.get("df") is None or orders_res["df"].empty:
         st.warning("⚠️ Chưa có dữ liệu Đơn hàng từ Tab 4 (Orders). Vui lòng thực hiện chuẩn hóa ở Tab 4 trước.")
         return
-        
     df_orders = orders_res["df"].copy()
-    
-    # Đọc dữ liệu từ file DIM_PRODUCT.xlsx đã lưu ở Tab 3
     product_file_path = os.path.join(OUT_PRODUCT, "DIM_PRODUCT.xlsx")
     prod_map = {}
-    
     if os.path.exists(product_file_path):
         try:
             df_product = pd.read_excel(product_file_path)
             for _, p_row in df_product.iterrows():
-                p_id = str(p_row.get("product_id", "")).strip()
-                p_name = str(p_row.get("product_name", "")).strip()
-                
-                l = parse_num(p_row.get("length_cm")) or 30.0
-                w = parse_num(p_row.get("width_cm")) or 20.0
-                h = parse_num(p_row.get("height_cm")) or 15.0
-                
+                p_id, p_name = str(p_row.get("product_id", "")).strip(), str(p_row.get("product_name", "")).strip()
+                l, w, h = parse_num(p_row.get("length_cm")) or 30.0, parse_num(p_row.get("width_cm")) or 20.0, parse_num(p_row.get("height_cm")) or 15.0
                 dim_info = {"l": l, "w": w, "h": h}
                 if p_id: prod_map[norm_basic(p_id)] = dim_info
                 if p_name: prod_map[norm_basic(p_name)] = dim_info
-            st.success(f"✅ Đã kết nối thành công tới file `{os.path.relpath(product_file_path, BASE_DIR)}` ({len(df_product)} sản phẩm).")
-        except Exception as exc:
-            st.error(f"❌ Lỗi khi đọc file DIM_PRODUCT.xlsx: {exc}")
-    else:
-        st.info("💡 Chưa tìm thấy file DIM_PRODUCT.xlsx ở Tab 3. Hệ thống sẽ áp dụng kích thước mặc định (30cm x 20cm x 15cm).")
+            st.success(f"✅ Đã kết nối thành công tới file `{os.path.relpath(product_file_path, BASE_DIR)}`.")
+        except Exception as exc: st.error(f"❌ Lỗi đọc file DIM_PRODUCT.xlsx: {exc}")
 
     solved_rows = []
     for _, o_row in df_orders.iterrows():
-        item_str = str(o_row.get("items", "")).strip()
-        item_norm = norm_basic(item_str)
-        
-        # Tra cứu 3 thông số Dài, Rộng, Cao từ DIM_PRODUCT.xlsx
+        item_norm = norm_basic(o_row.get("items", ""))
         dim = prod_map.get(item_norm, {"l": 30.0, "w": 20.0, "h": 15.0})
         l, w, h = dim["l"], dim["w"], dim["h"]
-        
         qty = int(parse_num(o_row.get("quantity")) or 1)
         actual_weight = parse_num(o_row.get("total_weight_kg"))
-        
-        # Công thức Volumetric Weight = (Dài x Rộng x Cao) x quantity / 4000
         volumetric_weight = (l * w * h * qty) / 4000.0
-        
-        # So sánh với total_weight_kg
-        if volumetric_weight > actual_weight:
-            bbs_code = "A"
-            bbs_desc = "A (Màu Cam - Hàng Cồng Kềnh)"
-        else:
-            bbs_code = "B"
-            bbs_desc = "B (Màu Xám - Hàng Nặng/Tiêu Chuẩn)"
-            
+        bbs_code = "A" if volumetric_weight > actual_weight else "B"
+        bbs_desc = "A (Màu Cam - Hàng Cồng Kềnh)" if bbs_code == "A" else "B (Màu Xám - Hàng Nặng/Tiêu Chuẩn)"
         province = extract_province(o_row.get("address", ""))
-        
         row_dict = o_row.to_dict()
         row_dict.update({
             "Tỉnh_Thành": province,
-            "Chiều_Dài_cm": l,
-            "Chiều_Rộng_cm": w,
-            "Chiều_Cao_cm": h,
+            "Chiều_Dài_cm": l, "Chiều_Rộng_cm": w, "Chiều_Cao_cm": h,
             "Kích_Thước_DxRxC_cm": f"{l:.0f} x {w:.0f} x {h:.0f}",
             "Volumetric_Weight_kg": round(volumetric_weight, 3),
-            "BBS": bbs_code,
-            "BBS_Phân_Loại": bbs_desc
+            "BBS": bbs_code, "BBS_Phân_Loại": bbs_desc
         })
         solved_rows.append(row_dict)
-        
     df_solved = pd.DataFrame(solved_rows)
-    
-    # 1. Thống kê KPI
     total_orders = len(df_solved)
     count_a = int((df_solved["BBS"] == "A").sum())
     count_b = int((df_solved["BBS"] == "B").sum())
     unique_provinces = df_solved["Tỉnh_Thành"].nunique()
-    
     kpi_c1, kpi_c2, kpi_c3, kpi_c4 = st.columns(4)
     kpi_c1.metric("📦 Tổng Số Đơn Hàng", f"{total_orders:,}")
-    kpi_c2.metric("🟧 Đơn Loại A (Cồng kềnh)", f"{count_a:,}", delta=f"{count_a/total_orders:.1%}" if total_orders else "0%")
-    kpi_c3.metric("⬜ Đơn Loại B (Nặng/Tiêu chuẩn)", f"{count_b:,}", delta=f"{count_b/total_orders:.1%}" if total_orders else "0%")
-    kpi_c4.metric("🗺️ Số Tỉnh/Thành Có Đơn", f"{unique_provinces}")
-    
+    kpi_c2.metric("🟧 Đơn Loại A (Cồng kềnh)", f"{count_a:,}")
+    kpi_c3.metric("⬜ Đơn Loại B (Nặng)", f"{count_b:,}")
+    kpi_c4.metric("🗺️ Số Tỉnh/Thành", f"{unique_provinces}")
     st.divider()
-    
-    # 2. Phân tách Tab Xem Chi Tiết
     t_summary, t_detail = st.tabs(["📊 1. Thống Kê Địa Lý Theo Tỉnh/Thành", "📋 2. Bảng Dữ Liệu Chi Tiết Level-Up"])
-    
     with t_summary:
-        st.markdown("##### 🏙️ Thống kê số lượng đơn và phân loại hàng A/B theo Tỉnh/Thành phố")
-        
         province_summary = df_solved.groupby("Tỉnh_Thành").agg(
             Tổng_Đơn=("order_id", "count"),
             Đơn_A_Cam=("BBS", lambda s: int((s == "A").sum())),
             Đơn_B_Xám=("BBS", lambda s: int((s == "B").sum()))
         ).reset_index()
-        
         province_summary["Tỷ_Lệ_%"] = (province_summary["Tổng_Đơn"] / total_orders * 100).round(1)
         province_summary = province_summary.sort_values(by="Tổng_Đơn", ascending=False).reset_index(drop=True)
-        
         st.dataframe(province_summary, use_container_width=True)
-        st.bar_chart(province_summary.set_index("Tỉnh_Thành")[["Đơn_A_Cam", "Đơn_B_Xám"]])
-
     with t_detail:
-        st.markdown("##### 📋 Toàn bộ bảng dữ liệu Đơn hàng đã nâng cấp (Hiển thị Dài, Rộng, Cao & Tô màu BBS)")
-        
-        filter_bbs = st.multiselect("Bộ lọc loại BBS:", ["A", "B"], default=["A", "B"], key="filter_bbs_sel")
-        df_display = df_solved[df_solved["BBS"].isin(filter_bbs)].copy()
-        
-        def highlight_bbs(val):
-            if val == "A":
-                return "background-color: #ffe0b2; color: #e65100; font-weight: bold;"
-            elif val == "B":
-                return "background-color: #e0e0e0; color: #424242; font-weight: bold;"
-            return ""
-
-        styled_df = df_display.style.map(highlight_bbs, subset=["BBS"])
+        styled_df = df_solved.style.map(lambda v: "background-color: #ffe0b2; color: #e65100; font-weight: bold;" if v == "A" else ("background-color: #e0e0e0; color: #424242; font-weight: bold;" if v == "B" else ""), subset=["BBS"])
         st.dataframe(styled_df, use_container_width=True)
-
-    # 3. Xuất file kết quả
     files = save_outputs(OUT_SOLVING, "DIM_ORDERS_SOLVED", "DIM_ORDERS_SOLVED", df_solved, extra_sheets={"THONG_KE_TINH": province_summary})
-    
-    st.divider()
-    st.info(f"📁 Báo cáo Level-Up đã được tự động lưu tại: `{os.path.relpath(files[0], BASE_DIR)}`")
-    with open(files[0], "rb") as fh:
-        st.download_button("⬇️ Tải Báo Cáo DIM_ORDERS_SOLVED.xlsx", fh.read(), file_name="DIM_ORDERS_SOLVED.xlsx", mime=XLSX_MIME, key="dl_orders_solved")
+    st.session_state["solved_result"] = {"df": df_solved, "files": files}
+
+# ============================================================================
+# 🗺️ TAB 6: ROUTING (KẾT NỐI 3 BẢNG VÀ GIAO HÀNG TIẾT KIỆM TÍM GOM THEO TỈNH)
+# ============================================================================
+def run_clarke_wright_routing(df_orders, df_fleet, df_wh):
+    wh_lat = df_wh.iloc[0]["lat"] if not df_wh.empty and "lat" in df_wh.columns else 21.0285
+    wh_lng = df_wh.iloc[0]["lng"] if not df_wh.empty and "lng" in df_wh.columns else 105.8542
+
+    inhouse_routes, ghtk_routes, full_3pl_routes = [], [], []
+
+    df_valid = df_orders.dropna(subset=["lat", "lng"]).copy()
+
+    # Tách nhóm đơn Giao Hàng Tiết Kiệm (Đi tỉnh ngoài Hà Nội hoặc được đánh dấu Tiết kiệm)
+    mask_ghtk = df_valid["address"].apply(lambda x: not is_hanoi_address(x))
+    df_ghtk = df_valid[mask_ghtk].copy()
+    df_inhouse_candidates = df_valid[~mask_ghtk].copy()
+
+    # 1. BẢNG 1: XE NHÀ (XANH LÁ CÂY)
+    if not df_fleet.empty and not df_inhouse_candidates.empty:
+        curr_route = []
+        curr_weight, curr_vol, curr_dist = 0.0, 0.0, 0.0
+        v_max_w = df_fleet.iloc[0].get("max_weight_kg", 5000.0)
+        v_max_v = df_fleet.iloc[0].get("max_volume_m3", 20.0)
+        v_max_d = df_fleet.iloc[0].get("Max_Distance", 100.0)
+
+        for _, row in df_inhouse_candidates.iterrows():
+            w = parse_num(row.get("total_weight_kg"))
+            v = parse_num(row.get("total_volume_m3"))
+            d = haversine(wh_lat, wh_lng, row["lat"], row["lng"]) * 2.0
+
+            if curr_weight + w <= v_max_w and curr_vol + v <= v_max_v and curr_dist + d <= v_max_d:
+                curr_route.append(row["order_id"])
+                curr_weight += w; curr_vol += v; curr_dist += d
+            else:
+                if curr_route:
+                    inhouse_routes.append({
+                        "Phương_Thức": "Xe Nhà (In-House Fleet)",
+                        "Mã_Tuyến": f"ROUTE_INHOUSE_{len(inhouse_routes)+1:02d}",
+                        "Biển_Số_Xe": df_fleet.iloc[0].get("license_plate", "29C-123.45"),
+                        "Danh_Sách_Đơn": ", ".join(curr_route),
+                        "Số_Lượng_Đơn": len(curr_route),
+                        "Tổng_Trọng_Tải_kg": round(curr_weight, 2),
+                        "Tỷ_Lệ_Lấp_Đầy_Trọng_Tải_%": round((curr_weight / v_max_w) * 100, 1),
+                        "Quãng_Đường_km": round(curr_dist, 1),
+                        "Loại_Tuyến": "Xe Nhà"
+                    })
+                curr_route = [row["order_id"]]
+                curr_weight, curr_vol, curr_dist = w, v, d
+
+        if curr_route:
+            inhouse_routes.append({
+                "Phương_Thức": "Xe Nhà (In-House Fleet)",
+                "Mã_Tuyến": f"ROUTE_INHOUSE_{len(inhouse_routes)+1:02d}",
+                "Biển_Số_Xe": df_fleet.iloc[0].get("license_plate", "29C-123.45"),
+                "Danh_Sách_Đơn": ", ".join(curr_route),
+                "Số_Lượng_Đơn": len(curr_route),
+                "Tổng_Trọng_Tải_kg": round(curr_weight, 2),
+                "Tỷ_Lệ_Lấp_Đầy_Trọng_Tải_%": round((curr_weight / v_max_w) * 100, 1),
+                "Quãng_Đường_km": round(curr_dist, 1),
+                "Loại_Tuyến": "Xe Nhà"
+            })
+
+    # 2. BẢNG 2: GIAO HÀNG TIẾT KIỆM (MÀU TÍM) - SẮP XẾP SẮP LIÊN TIẾP THEO TỈNH
+    if not df_ghtk.empty:
+        df_ghtk_sorted = df_ghtk.sort_values(by="Tỉnh_Thành").reset_index(drop=True)
+        for _, row in df_ghtk_sorted.iterrows():
+            ghtk_routes.append({
+                "Phương_Thức": "Giao Hàng Tiết Kiệm (GHTK)",
+                "Mã_Đơn": row.get("order_id"),
+                "Tỉnh_Thành_Phố": row.get("Tỉnh_Thành"),
+                "Địa_Chỉ_Chi_Tiết": row.get("address"),
+                "Trọng_Lượng_kg": row.get("total_weight_kg"),
+                "Loại_Tiết_Kiệm": "Tiết Kiệm Loại 1 (Đi Tỉnh)",
+                "Lý_Do": f"Giao đơn lẻ đi tỉnh {row.get('Tỉnh_Thành')}"
+            })
+
+    # 3. BẢNG 3: THUÊ XE NGOÀI FULL TRUCK (3PL)
+    mask_full_3pl = df_valid["total_weight_kg"] > 5000.0
+    df_3pl = df_valid[mask_full_3pl].copy()
+    for _, row in df_3pl.iterrows():
+        full_3pl_routes.append({
+            "Phương_Thức": "Thuê Xe Ngoài Nguyên Chuyến (3PL)",
+            "Mã_Đơn": row.get("order_id"),
+            "Tỉnh_Thành": row.get("Tỉnh_Thành"),
+            "Trọng_Tải_kg": row.get("total_weight_kg"),
+            "Loại_Xe_Thuê": "Xe 3PL Tiết kiệm Loại 1",
+            "Ước_Tính_Cước": "Thuê ngoài 3PL"
+        })
+
+    return pd.DataFrame(inhouse_routes), pd.DataFrame(ghtk_routes), pd.DataFrame(full_3pl_routes)
+
+def render_routing_tab():
+    st.header("🚚 6. Phân Tuyến Tối Ưu (Routing Optimization)")
+    st.caption("🌐 *Tự động nạp dữ liệu từ các Tab 1, 2, 5 để phân chia 3 bảng luồng vận chuyển (Xe nhà, GHTK Tím, Thuê ngoài 3PL)*")
+
+    # Đọc dữ liệu từ session_state hoặc các file output
+    df_solved = st.session_state.get("solved_result", {}).get("df")
+    if df_solved is None:
+        file_solved = os.path.join(OUT_SOLVING, "DIM_ORDERS_SOLVED.xlsx")
+        if os.path.exists(file_solved): df_solved = pd.read_excel(file_solved)
+
+    df_fleet = st.session_state.get("fleet_result", {}).get("df")
+    if df_fleet is None:
+        file_fleet = os.path.join(OUT_FLEET, "DIM_VEHICLE.xlsx")
+        if os.path.exists(file_fleet): df_fleet = pd.read_excel(file_fleet)
+
+    df_wh = st.session_state.get("wh_result", {}).get("df")
+    if df_wh is None:
+        file_wh = os.path.join(OUT_WAREHOUSE, "WAREHOUSE_WITH_COORDINATES.xlsx")
+        if os.path.exists(file_wh): df_wh = pd.read_excel(file_wh)
+
+    if df_solved is None or df_solved.empty:
+        st.warning("⚠️ Chưa có dữ liệu đơn hàng đã xử lý từ Tab 5 (Orders Solving).")
+        return
+
+    if st.button("🚀 Tối Ưu Hóa Tuyến Đường (Clarke-Wright Engine)", type="primary"):
+        df_inhouse, df_ghtk, df_3pl = run_clarke_wright_routing(
+            df_solved, 
+            df_fleet if df_fleet is not None else pd.DataFrame(), 
+            df_wh if df_wh is not None else pd.DataFrame()
+        )
+        st.session_state["routing_tables"] = {"inhouse": df_inhouse, "ghtk": df_ghtk, "3pl": df_3pl}
+
+    rt_tables = st.session_state.get("routing_tables")
+    if rt_tables is not None:
+        st.markdown("### 📊 BẢNG ROUTING TẠM THỜI (PHÂN CHIA 3 LUỒNG VẬN TẢI)")
+
+        t_inhouse, t_ghtk, t_3pl = st.tabs([
+            f"🟩 1. Tuyến Xe Nhà ({len(rt_tables['inhouse'])})",
+            f"🟪 2. Giao Hàng Tiết Kiệm Tỉnh ({len(rt_tables['ghtk'])})",
+            f"🟧 3. Thuê Xe Ngoài 3PL ({len(rt_tables['3pl'])})"
+        ])
+
+        with t_inhouse:
+            st.markdown("##### 🟩 Các tuyến đường đã tối ưu bằng XE NHÀ")
+            styled_inhouse = rt_tables["inhouse"].style.set_properties(**{'background-color': '#e8f5e9', 'color': '#1b5e20', 'font-weight': 'bold'})
+            st.dataframe(styled_inhouse, use_container_width=True)
+
+        with t_ghtk:
+            st.markdown("##### 🟪 Các tuyến GIAO HÀNG TIẾT KIỆM (Các đơn cùng Tỉnh/Thành được xếp LIÊN TIẾP LIỀN MẠCH)")
+            styled_ghtk = rt_tables["ghtk"].style.set_properties(**{'background-color': '#f3e5f5', 'color': '#4a148c', 'font-weight': 'bold'})
+            st.dataframe(styled_ghtk, use_container_width=True)
+
+        with t_3pl:
+            st.markdown("##### 🟧 Các tuyến THUÊ XE NGOÀI FULL (3PL)")
+            styled_3pl = rt_tables["3pl"].style.set_properties(**{'background-color': '#fff3e0', 'color': '#e65100', 'font-weight': 'bold'})
+            st.dataframe(styled_3pl, use_container_width=True)
+
+        st.divider()
+
+        # PHẦN 2: PHÂN CÔNG TÀI XẾ & BẢNG FINAL
+        st.markdown("### 👨‍✈️ BẢNG NHẬP XE & PHÂN CÔNG TÀI XẾ")
+        c1, c2 = st.columns(2)
+        with c1:
+            driver_name = st.text_input("Tên Tài xế gán tuyến:", value="Nguyễn Văn Tài")
+        with c2:
+            driver_license = st.selectbox("Bằng lái:", ["B2", "C", "FC", "FD"], index=1)
+
+        if st.button("📌 LƯU & XUẤT BẢNG ROUTING FINAL TỐI ƯU CUỐI CÙNG", type="primary"):
+            df_inhouse_final = rt_tables["inhouse"].copy()
+            df_inhouse_final["Tài_Xế"] = driver_name
+            df_inhouse_final["Bằng_Lái"] = driver_license
+
+            files = save_outputs(
+                OUT_ROUTING, 
+                "FINAL_ROUTING_PLAN", 
+                "XE_NHA_FINAL", 
+                df_inhouse_final, 
+                extra_sheets={"GHTK_TIET_KIEM": rt_tables["ghtk"], "THUE_NGOAI_3PL": rt_tables["3pl"]}
+            )
+
+            st.success("🎉 ĐÃ XUẤT BẢNG ROUTING FINAL HOÀN CHỈNH THÀNH CÔNG!")
+            st.info(f"📁 Báo cáo Routing Final đã được lưu tại: `{os.path.relpath(files[0], BASE_DIR)}`")
+            with open(files[0], "rb") as fh:
+                st.download_button("⬇️ Tải Báo Cáo FINAL_ROUTING_PLAN.xlsx", fh.read(), file_name="FINAL_ROUTING_PLAN.xlsx", mime=XLSX_MIME, key="dl_routing_final")
 
 # ============================================================================
 # ⚙️ MAIN CONTAINERS
@@ -916,7 +967,8 @@ TAB_NAMES = [
     "🏭 2. Warehouse",
     "📦 3. Product",
     "🧾 4. Orders",
-    "⚡ 5. Orders Solving"
+    "⚡ 5. Orders Solving",
+    "🗺️ 6. Routing"
 ]
 
 def main():
@@ -926,7 +978,7 @@ def main():
         if st.button("🧹 Giải phóng RAM & Cache", key="free_ram"):
             st.cache_data.clear()
             for k in list(st.session_state):
-                if k.endswith(("_raw", "_result", "_meta", "_why", "_auto_table")):
+                if k.endswith(("_raw", "_result", "_meta", "_why", "_auto_table", "routing_tables")):
                     st.session_state.pop(k, None)
             st.rerun()
     tabs = st.tabs(TAB_NAMES)
@@ -935,6 +987,7 @@ def main():
     with tabs[2]: render_product_tab()
     with tabs[3]: render_orders_tab()
     with tabs[4]: render_orders_solving_tab()
+    with tabs[5]: render_routing_tab()
 
 if __name__ == "__main__":
     main()
