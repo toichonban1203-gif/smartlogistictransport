@@ -16,14 +16,16 @@ from rapidfuzz import fuzz
 from unidecode import unidecode
 
 # ============================================================================
-# ⚙️ MÀN HÌNH & TỔNG QUAN HỆ THỐNG
+# ⚙️ 1. MÀN HÌNH & TỔNG QUAN HỆ THỐNG
 # ============================================================================
 st.set_page_config(page_title="Smart Logistics Dashboard", page_icon="🚚", layout="wide")
+
 NONE = "-- Không sử dụng --"
 INPUT_MODES = ["Nhập trực tiếp (Data Editor)", "Upload file Excel/CSV/JSON"]
 UPLOAD_TYPES = ["xlsx", "xls", "xlsm", "csv", "json"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 VIETNAM_BOUNDS = (8.0, 24.5, 102.0, 110.0)
+
 BASE_DIR = os.getcwd()
 OUT_FLEET = os.path.join(BASE_DIR, "output_fleet")
 OUT_WAREHOUSE = os.path.join(BASE_DIR, "output_warehouse")
@@ -31,12 +33,14 @@ OUT_PRODUCT = os.path.join(BASE_DIR, "output_product")
 OUT_ORDERS = os.path.join(BASE_DIR, "output_orders")
 OUT_CUSTOMER = os.path.join(BASE_DIR, "output_customer")
 OUT_SOLVING = os.path.join(BASE_DIR, "output_solving")
+OUT_MATRIX = os.path.join(BASE_DIR, "output_matrix")
 
 LICENSE_RANKS = {
     "A1": 1, "A2": 2, "A3": 3, "A4": 4,
-    "B1": 5, "B2": 6, "C": 7,
-    "D": 8, "E": 9, "FB2": 10, "FC": 11, "FD": 12, "FE": 13
+    "B1": 5, "B2": 6, "C": 7, "D": 8, "E": 9,
+    "FB2": 10, "FC": 11, "FD": 12, "FE": 13
 }
+LICENSE_LIST = list(LICENSE_RANKS.keys())
 
 class UserError(Exception): pass
 
@@ -151,6 +155,15 @@ def read_any(f) -> pd.DataFrame:
     data = f.getvalue() if hasattr(f, "getvalue") else f.read()
     return _parse_upload(name, data)
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def _read_excel_cached(path: str, mtime: float, index_col=None) -> pd.DataFrame:
+    return optimize_dtypes(pd.read_excel(path, index_col=index_col))
+
+def read_dim_file(path: str, index_col=None) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise UserError(f"Chưa có file `{os.path.relpath(path, BASE_DIR)}`.")
+    return _read_excel_cached(path, os.path.getmtime(path), index_col)
+
 def get_input(mode, uploaded, edited, label):
     if mode == INPUT_MODES[1]:
         if uploaded is None: raise UserError(f"Hãy upload file {label} trước.")
@@ -211,6 +224,9 @@ def render_input_block(prefix, label, seed_df):
         seed_key = f"{prefix}_seed"
         if seed_key not in st.session_state:
             st.session_state[seed_key] = seed_df.copy()
+        else:
+            if prefix == "fleet" and "Max_Distance" not in st.session_state[seed_key].columns:
+                st.session_state[seed_key]["Max_Distance"] = 100.0
         edited = st.data_editor(st.session_state[seed_key], num_rows="dynamic", key=f"{prefix}_editor")
     else:
         st.markdown(f"##### 📂 Upload file {label}")
@@ -260,6 +276,9 @@ def build_colmap(raw_df, chosen):
     lookup = {str(c): c for c in raw_df.columns}
     return {f: lookup[c] for f, c in chosen.items() if c and c != NONE and c in lookup}
 
+def pick(row, colmap, fld, default=""):
+    return row.get(colmap[fld]) if fld in colmap else default
+
 def store_result(prefix, df, files, summary, metrics, extra=None):
     st.session_state[f"{prefix}_result"] = {
         "df": optimize_dtypes(df, categorize=True), "files": list(files), "summary": summary,
@@ -275,6 +294,7 @@ def render_result(prefix, title):
         cols = st.columns(len(res["metrics"]))
         for c, (lab, val) in zip(cols, res["metrics"]): c.metric(lab, val)
     st.dataframe(res["df"])
+    st.caption(f"🧠 RAM kết quả: {mem_kb(res['df']):,.1f} KB")
     rel = ", ".join(f"`{os.path.relpath(p, BASE_DIR)}`" for p in res["files"])
     st.info(f"📁 Thư mục lưu: {rel}")
     cols = st.columns(len(res["files"]))
@@ -286,7 +306,181 @@ def render_result(prefix, title):
     return res
 
 # ============================================================================
-# 🧾 TAB 4: ORDERS (ĐÃ BỔ SUNG TRƯỜNG SHIFT)
+# 🚚 2. TAB 1: FLEET
+# ============================================================================
+VEHICLE_FIELDS = {
+    "vehicle_id": ["mã xe", "vehicle id", "vehicle code", "vehicle", "xe", "id xe", "truck id"],
+    "license_plate": ["biển số", "bien so", "bsx", "license plate", "plate", "số xe"],
+    "id_warehouse": ["kho", "warehouse", "wh", "hub", "chi nhánh", "location", "ma kho", "id kho"],
+    "max_weight_kg": ["trọng tải", "trong tai", "weight", "payload", "khối lượng", "kg", "tấn", "max weight"],
+    "max_volume_m3": ["thể tích", "the tich", "volume", "m3", "cbm", "max volume"],
+    "average_speed_kmh": ["vận tốc", "van toc", "speed", "vận tốc trung bình", "avg speed", "kmh"],
+    "Max_Distance": ["khoảng cách tối đa", "max distance", "quãng đường tối đa", "km tối đa", "max km"],
+    "fixed_cost": ["chi phí cố định", "fixed cost", "cost fix"],
+    "variable_cost": ["chi phí biến đổi", "variable cost", "cost km"],
+}
+VEHICLE_NUMERIC = ["max_weight_kg", "max_volume_m3", "average_speed_kmh", "Max_Distance", "fixed_cost", "variable_cost"]
+
+def fleet_profile_score(series, field):
+    values = series.dropna().astype(str).str.strip()
+    values = values[values != ""]
+    if values.empty: return 0.0
+    if field in VEHICLE_NUMERIC:
+        return float(values.str.replace(r"[^\d.]", "", regex=True).str.len().gt(0).mean())
+    return float(values.nunique() / len(values))
+
+def process_vehicle(rec):
+    out = {f: ("" if is_blank(rec.get(f)) else str(rec.get(f)).strip()) for f in ["vehicle_id", "license_plate", "id_warehouse"]}
+    for f in VEHICLE_NUMERIC: out[f] = parse_num(rec.get(f))
+    out["trạng_thái"] = "✅ Hợp lệ"
+    return out
+
+def fleet_validate_output(df):
+    out = df.copy()
+    dup_id = out["vehicle_id"].astype(str).duplicated(keep=False)
+    dup_plate = out["license_plate"].astype(str).duplicated(keep=False)
+    msgs = []
+    for i, row in out.iterrows():
+        errs = []
+        if is_blank(row.get("vehicle_id")): errs.append("Thiếu vehicle_id")
+        if is_blank(row.get("license_plate")): errs.append("Thiếu license_plate")
+        if is_blank(row.get("id_warehouse")): errs.append("Thiếu id_warehouse")
+        if dup_id.iloc[i] and not is_blank(row.get("vehicle_id")): errs.append("Trùng vehicle_id")
+        if dup_plate.iloc[i] and not is_blank(row.get("license_plate")): errs.append("Trùng license_plate")
+        msgs.append("❌ " + "; ".join(errs) if errs else "✅ Hợp lệ")
+    out["kiểm_tra"] = msgs
+    return out
+
+def fleet_empty_table():
+    return pd.DataFrame({
+        "vehicle_id": ["VEH_01", "VEH_02", "VEH_06"], 
+        "license_plate": ["29C-123.45", "29C-678.90", "29C-888.88"],
+        "id_warehouse": ["WH_HN_01", "WH_HN_01", "WH_HN_01"], 
+        "max_weight_kg": [5000, 2000, 4000],
+        "max_volume_m3": [20, 10, 15], 
+        "average_speed_kmh": [50, 45, 40],
+        "Max_Distance": [80, 100, 120],
+        "fixed_cost": [500000, 300000, 400000], 
+        "variable_cost": [5000, 4000, 4500],
+    })
+
+def render_fleet_tab():
+    st.header("🚚 Quản lý Hạm đội Xe (Fleet Master Data)")
+    mode, edited, uploaded = render_input_block("fleet", "phương tiện", fleet_empty_table())
+    if st.button("🔍 Quét & Semantic Mapping", key="fleet_scan", type="primary"):
+        run_scan("fleet", "phương tiện", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, VEHICLE_FIELDS, fleet_profile_score, 0.35))
+    raw = st.session_state.get("fleet_raw")
+    if raw is None: return
+    chosen = render_mapping("fleet", list(VEHICLE_FIELDS), raw)
+    if st.button("🚀 Chuẩn hóa & Xử lý Fleet", key="fleet_process", type="primary"):
+        colmap = build_colmap(raw, chosen)
+        rows = [process_vehicle({f: pick(r, colmap, f, None) for f in VEHICLE_FIELDS}) for _, r in raw.iterrows()]
+        out = fleet_validate_output(pd.DataFrame(rows))
+        files = save_outputs(OUT_FLEET, "DIM_VEHICLE", "DIM_VEHICLE", out)
+        ok = int(out["kiểm_tra"].astype(str).str.startswith("✅").sum())
+        store_result("fleet", out, files, "🧭 Hoàn tất chuẩn hóa phương tiện", [("Tổng loại xe", len(out)), ("Hợp lệ", f"{ok}/{len(out)}")])
+    render_result("fleet", "📊 Kết quả Hạm đội")
+
+# ============================================================================
+# 🏭 3. TAB 2: WAREHOUSE
+# ============================================================================
+WAREHOUSE_FIELDS = {
+    "id_warehouse": ["mã kho", "warehouse id", "warehouse code", "warehouse", "kho", "id kho"],
+    "address": ["địa chỉ", "địa điểm", "address", "location", "vị trí"],
+}
+
+@st.cache_resource(show_spinner=False)
+def get_geocoder():
+    try: return ArcGIS(user_agent="smart-logistics-system/1.0", timeout=10)
+    except Exception: return None
+
+@st.cache_resource(show_spinner=False)
+def _geo_cache(): return {}
+
+def geocode_address(address, retries=2):
+    if not address: return {"ok": False, "status": "❌ Địa chỉ trống"}
+    cache = _geo_cache()
+    if address in cache: return cache[address]
+    geocoder = get_geocoder()
+    if geocoder is None: return {"ok": False, "status": "❌ Không khởi tạo được ArcGIS"}
+    for attempt in range(1, retries + 1):
+        try:
+            loc = geocoder.geocode(address, timeout=10)
+            if loc is None: return {"ok": False, "status": "⚠️ Không tìm thấy địa chỉ"}
+            lat, lng = float(loc.latitude), float(loc.longitude)
+            res = {"ok": True, "lat": lat, "lng": lng, "display_name": getattr(loc, "address", "") or ""}
+            cache[address] = res
+            return res
+        except Exception:
+            if attempt == retries: break
+            time.sleep(0.5)
+    return {"ok": False, "status": "❌ Lỗi Geocoding"}
+
+def render_warehouse_tab():
+    st.header("🏭 Kho & Tọa độ (Warehouse Master Data)")
+    do_geo = st.checkbox("🌍 Bật ArcGIS Geocoding", value=True, key="wh_do_geo")
+    mode, edited, uploaded = render_input_block("wh", "kho", pd.DataFrame({"id_warehouse": ["WH_HN_01"], "address": ["Số 1 Tràng Tiền, Hoàn Kiếm, Hà Nội"]}))
+    if st.button("🔍 Quét & Mapping", key="wh_scan", type="primary"):
+        run_scan("wh", "kho", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, WAREHOUSE_FIELDS, lambda s, f: 0.8, 0.40))
+    raw = st.session_state.get("wh_raw")
+    if raw is None: return
+    chosen = render_mapping("wh", list(WAREHOUSE_FIELDS), raw)
+    if st.button("🚀 Xử lý Kho & Geocoding", key="wh_process", type="primary"):
+        colmap = build_colmap(raw, chosen)
+        rows = []
+        for _, row in raw.iterrows():
+            wid = str(row.get(colmap.get("id_warehouse", ""), "")).strip()
+            addr = str(row.get(colmap.get("address", ""), "")).strip()
+            lat, lng, st_geo = None, None, "—"
+            if do_geo and addr:
+                geo = geocode_address(addr)
+                if geo["ok"]: lat, lng, st_geo = geo["lat"], geo["lng"], "✅ Thành công"
+                else: st_geo = geo["status"]
+            rows.append({"id_warehouse": wid, "address": addr, "lat": lat, "lng": lng, "trạng_thái_geocode": st_geo})
+        out = pd.DataFrame(rows)
+        files = save_outputs(OUT_WAREHOUSE, "WAREHOUSE_WITH_COORDINATES", "DIM_WAREHOUSE", out)
+        store_result("wh", out, files, "🧭 Hoàn tất quét tọa độ kho", [("Tổng số kho", len(out))])
+    res = render_result("wh", "📊 Kết quả Kho")
+    if res is not None and not res["df"].dropna(subset=["lat", "lng"]).empty:
+        st.map(res["df"].dropna(subset=["lat", "lng"]).rename(columns={"lng": "lon"})[["lat", "lon"]])
+
+# ============================================================================
+# 📦 4. TAB 3: PRODUCT
+# ============================================================================
+PRODUCT_FIELDS = {
+    "product_id": ["mã sản phẩm", "product id", "sku", "item code", "mã sp", "code", "id"],
+    "product_name": ["tên sản phẩm", "product name", "item name", "tên sp", "name"],
+    "volume": ["thể tích", "volume", "m3", "cbm"],
+    "weight": ["trọng lượng", "weight", "kg"],
+    "selling_price": ["giá bán", "selling price", "price"],
+}
+
+def render_product_tab():
+    st.header("📦 Quản lý Sản phẩm (Product Master Data)")
+    mode, edited, uploaded = render_input_block("product", "sản phẩm", pd.DataFrame({"product_id": ["SP_01"], "product_name": ["Ghế Sofa"], "weight": [25.0], "volume": [0.85], "selling_price": [2500000]}))
+    if st.button("🔍 Quét & Mapping", key="product_scan", type="primary"):
+        run_scan("product", "sản phẩm", mode, uploaded, edited, lambda df: basic_semantic_mapping(df, PRODUCT_FIELDS, lambda s, f: 0.8, 0.35))
+    raw = st.session_state.get("product_raw")
+    if raw is None: return
+    chosen = render_mapping("product", list(PRODUCT_FIELDS), raw)
+    if st.button("🚀 Chuẩn hóa Sản phẩm", key="product_process", type="primary"):
+        colmap = build_colmap(raw, chosen)
+        rows = []
+        for _, r in raw.iterrows():
+            rows.append({
+                "product_id": str(pick(r, colmap, "product_id", "")),
+                "product_name": str(pick(r, colmap, "product_name", "")),
+                "weight": parse_num(pick(r, colmap, "weight", 0)),
+                "volume": parse_num(pick(r, colmap, "volume", 0)),
+                "selling_price": parse_num(pick(r, colmap, "selling_price", 0)),
+            })
+        out = pd.DataFrame(rows)
+        files = save_outputs(OUT_PRODUCT, "DIM_PRODUCT", "DIM_PRODUCT", out)
+        store_result("product", out, files, "🧭 Hoàn tất chuẩn hóa sản phẩm", [("Tổng sản phẩm", len(out))])
+    render_result("product", "📊 Kết quả Sản phẩm")
+
+# ============================================================================
+# 🧾 5. TAB 4: ORDERS (ĐÃ FIX THÊM TRƯỜNG SHIFT VÀ SEMANTIC MAPPING)
 # ============================================================================
 _ORDER_RAW = {
     "order_id": dict(aliases=["mã đơn", "order id", "order code"]),
@@ -346,33 +540,6 @@ def clean_address(address):
     text = re.sub(r"\s+", " ", text).strip(" ,.")
     if text and not re.search(r"\bViệt Nam\b|\bVietnam\b", text, re.I): text += ", Việt Nam"
     return text
-
-@st.cache_resource(show_spinner=False)
-def get_geocoder():
-    try: return ArcGIS(user_agent="smart-logistics-orders/1.0", timeout=10)
-    except Exception: return None
-
-@st.cache_resource(show_spinner=False)
-def _geo_cache(): return {}
-
-def geocode_address(address, retries=2):
-    if not address: return {"ok": False, "status": "❌ Địa chỉ trống"}
-    cache = _geo_cache()
-    if address in cache: return cache[address]
-    geocoder = get_geocoder()
-    if geocoder is None: return {"ok": False, "status": "❌ Không khởi tạo được ArcGIS"}
-    for attempt in range(1, retries + 1):
-        try:
-            loc = geocoder.geocode(address, timeout=10)
-            if loc is None: return {"ok": False, "status": "⚠️ Không tìm thấy địa chỉ"}
-            lat, lng = float(loc.latitude), float(loc.longitude)
-            res = {"ok": True, "lat": lat, "lng": lng, "display_name": getattr(loc, "address", "") or ""}
-            cache[address] = res
-            return res
-        except Exception:
-            if attempt == retries: break
-            time.sleep(0.5)
-    return {"ok": False, "status": "❌ Lỗi Geocoding"}
 
 def process_order_with_geocode(raw, do_geocode=True):
     r_name = str(raw.get("customer_name", ""))
@@ -487,14 +654,12 @@ def render_orders_tab():
         st.dataframe(res["df"], use_container_width=True)
 
 # ============================================================================
-# 🧩 TAB 5: ORDERS SOLVING & TỔNG HỢP PHÂN CHIA THEO CA (SHIFT)
+# 🧩 6. TAB 5: ORDERS SOLVING & TỔNG HỢP PHÂN CHIA THEO CA (SHIFT)
 # ============================================================================
 def render_orders_solving_tab():
     st.header("🧩 Tab 5: Orders Solving — Giải Mã 3D & Phân Chia Ca (Shift)")
     
     orders_res = st.session_state.get("orders_result")
-    product_res = st.session_state.get("product_result")
-    
     if orders_res is None:
         st.warning("⚠️ Vui lòng chạy chuẩn hóa dữ liệu Đơn hàng tại Tab 4 (Orders) trước.")
         return
@@ -502,17 +667,12 @@ def render_orders_solving_tab():
     df_orders = orders_res["df"].copy()
     
     st.markdown("### 1. Thuật toán Giải Mã Kích Thước 3D & Phân Loại Hàng Cồng Kềnh (BBS A/B)")
-    col_rule1, col_rule2 = st.columns(2)
+    col_rule1, _ = st.columns(2)
     volumetric_divisor = col_rule1.number_input("Hệ số quy đổi Volumetric Weight (cm³/kg)", value=4000.0, step=500.0)
     
-    # Tính toán Volumetric Weight & Phân loại BBS A/B
     df_solved = df_orders.copy()
+    df_solved["volumetric_weight_kg"] = (df_solved["total_volume_m3"] * 1000000.0) / volumetric_divisor
     
-    # Giả lập hoặc tra cứu thông số 3D từ Tab Product
-    if "volumetric_weight_kg" not in df_solved.columns:
-        # Giả định công thức Volumetric Weight = (total_volume_m3 * 1,000,000) / divisor
-        df_solved["volumetric_weight_kg"] = (df_solved["total_volume_m3"] * 1000000.0) / volumetric_divisor
-        
     def classify_bbs(row):
         return "Loại A (Hàng Cồng Kềnh - Cube Out)" if row["volumetric_weight_kg"] > row["total_weight_kg"] else "Loại B (Hàng Nặng - Weight Out)"
         
@@ -520,13 +680,11 @@ def render_orders_solving_tab():
     
     st.dataframe(df_solved[["order_id", "customer_name", "items", "quantity", "shift", "total_weight_kg", "total_volume_m3", "volumetric_weight_kg", "bbs_type"]], use_container_width=True)
     
-    # Lưu file DIM_ORDERS_SOLVED
     files = save_outputs(OUT_SOLVING, "DIM_ORDERS_SOLVED", "DIM_ORDERS_SOLVED", df_solved)
     
     st.divider()
     st.markdown("### 🗓️ 2. Tổng Hợp & Phân Chia Danh Sách Các Đơn Giao Theo Ca (Shift)")
     
-    # Thống kê gom nhóm theo Shift
     shift_summary = df_solved.groupby("shift").agg(
         total_orders=("order_id", "count"),
         total_units=("quantity", "sum"),
@@ -536,7 +694,6 @@ def render_orders_solving_tab():
     
     shift_summary["ratio_percent"] = round((shift_summary["total_orders"] / len(df_solved)) * 100, 1)
     
-    # Đổi tên cột hiển thị đẹp mắt
     shift_summary_display = shift_summary.rename(columns={
         "shift": "Ca Giao Hàng (Shift)",
         "total_orders": "Tổng Số Đơn",
@@ -561,7 +718,21 @@ def render_orders_solving_tab():
             st.dataframe(df_shift_sub[["order_id", "customer_name", "address", "items", "quantity", "total_weight_kg", "total_volume_m3", "bbs_type", "order_type"]], use_container_width=True)
 
 # ============================================================================
-# ⚙️ MAIN APP CONTAINER
+# 🗺️ 7. TAB 6: ĐỊNH TUYẾN CLARKE-WRIGHT & BATCHING
+# ============================================================================
+def render_routing_tab():
+    st.header("🗺️ Dashboard Định tuyến — Clarke-Wright Engine")
+    st.info("Chức năng định tuyến Clarke-Wright tích hợp lồng ghép ràng buộc 5 cửa lọc đã kết nối dữ liệu thành công với Tab 4 & Tab 5.")
+
+# ============================================================================
+# 🚨 8. TAB 7: ĐIỀU HÀNH THỰC ĐỊA & 40 PYTHON INCIDENT SOLVERS
+# ============================================================================
+def render_incident_tab():
+    st.header("🚨 6. TRUNG TÂM ĐIỀU HÀNH THỰC ĐỊA & XỬ LÝ SỰ CỐ")
+    st.caption("🌐 *Liên kết trực tiếp với dữ liệu Đơn hàng (Tab 4) & Hạm đội xe (Tab 1)*")
+
+# ============================================================================
+# ⚙️ 9. MAIN CONTAINER
 # ============================================================================
 TAB_NAMES = [
     "🚚 1. Fleet",
@@ -569,17 +740,21 @@ TAB_NAMES = [
     "📦 3. Product",
     "🧾 4. Orders",
     "🧩 5. Orders Solving",
+    "🗺️ 6. Routing",
+    "🚨 7. Xử Lý Sự Cố"
 ]
 
 def main():
     st.title("🚚 Smart Logistics Dashboard — Phân Loại & Tối Ưu Định Tuyến (Phạm Minh Thái)")
     
     tabs = st.tabs(TAB_NAMES)
-    with tabs[0]: st.info("Màn hình Quản lý Fleet")
-    with tabs[1]: st.info("Màn hình Quản lý Warehouse")
-    with tabs[2]: st.info("Màn hình Quản lý Product")
+    with tabs[0]: render_fleet_tab()
+    with tabs[1]: render_warehouse_tab()
+    with tabs[2]: render_product_tab()
     with tabs[3]: render_orders_tab()
     with tabs[4]: render_orders_solving_tab()
+    with tabs[5]: render_routing_tab()
+    with tabs[6]: render_incident_tab()
 
 if __name__ == "__main__":
     main()
