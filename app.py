@@ -520,7 +520,7 @@ def render_warehouse_tab():
 PRODUCT_FIELDS = {
     "product_id":    ["mã sản phẩm","product id","sku","item code","mã sp","code","id"],
     "product_name":  ["tên sản phẩm","product name","item name","tên sp","name"],
-    "volume":        ["thể tích","volume","m3","cbm"],
+    "volume":        ["thể tích","volume","m3","cbm","cm3"],
     "weight":        ["trọng lượng","weight","kg"],
     "cost_price":    ["giá sản xuất","cost price","cost"],
     "selling_price": ["giá bán","selling price","price"],
@@ -548,8 +548,8 @@ def render_product_tab():
     st.header("📦 Quản lý Sản phẩm (Product Master Data)")
     mode, edited, uploaded = render_input_block(
         "product","sản phẩm",
-        pd.DataFrame({"product_id":["SP_01"],"product_name":["Ghế Sofa"],
-                      "weight":[25.0],"selling_price":[2500000]}))
+        pd.DataFrame({"product_id":["P022"],"product_name":["Giường đôi 1m8"],
+                      "volume":[10497600],"weight":[65.0],"selling_price":[8500000]}))
     if st.button("🔍 Quét & Mapping",key="product_scan",type="primary"):
         run_scan("product","sản phẩm",mode,uploaded,edited,
                  lambda df: basic_semantic_mapping(df,PRODUCT_FIELDS,lambda s,f:0.8,0.35))
@@ -573,7 +573,7 @@ _ORDER_RAW = {
     "customer_id":     dict(aliases=["mã khách","customer id"]),
     "customer_name":   dict(aliases=["tên khách","customer name","name"]),
     "quantity":        dict(aliases=["số lượng","qty","quantity","units"]),
-    "items":           dict(aliases=["mặt hàng","items","product","sản phẩm"]),
+    "items":           dict(aliases=["mặt hàng","items","product","sản phẩm","product_id"]),
     "total_weight_kg": dict(aliases=["trọng lượng","weight","kg"]),
     "total_volume_m3": dict(aliases=["thể tích","volume","m3"]),
     "shift":           dict(aliases=["shift","ca","kíp","buổi","ca giao","ca làm việc","buổi giao"]),
@@ -622,30 +622,66 @@ def orders_semantic_mapping(df):
         result[fld] = (best_col,best_score,"tên cột") if best_score > 0.3 else (None,0.0,"")
     return result
 
-def process_order_with_geocode(raw, do_geocode=True):
+def load_product_lookup():
+    prod_file = os.path.join(OUT_PRODUCT, "DIM_PRODUCT.xlsx")
+    if not os.path.exists(prod_file):
+        return {}
+    try:
+        df_prod = pd.read_excel(prod_file)
+        lookup = {}
+        for _, r in df_prod.iterrows():
+            pid = str(r.get("product_id", "")).strip()
+            pname = str(r.get("product_name", "")).strip()
+            vol = parse_num(r.get("volume"))
+            w = parse_num(r.get("weight"))
+            if pid: lookup[pid] = {"volume": vol, "weight": w}
+            if pname: lookup[pname] = {"volume": vol, "weight": w}
+        return lookup
+    except Exception:
+        return {}
+
+def process_order_with_geocode(raw, do_geocode=True, product_lookup=None):
     r_name   = str(raw.get("customer_name",""))
     cust_name = r_name or "Khách lẻ"
     t_type   = match_label(raw.get("order_type",""),TYPE_LK) or \
                ("B2B" if "cong ty" in norm_basic(r_name) else "B2C")
     t_alert  = match_label(raw.get("alert_status",""),ALERT_LK) or "Normal"
-    q   = parse_qty(raw.get("quantity"))
-    w   = parse_qty(raw.get("total_weight_kg"))
-    v   = parse_qty(raw.get("total_volume_m3"),dot_is_decimal=True)
-    shift_val   = normalize_shift(raw.get("shift"))
-    addr        = str(raw.get("address","")).strip()
-    cleaned_addr= clean_address(addr)
+    q        = parse_qty(raw.get("quantity")) or 1.0
+    shift_val= normalize_shift(raw.get("shift"))
+    addr     = str(raw.get("address","")).strip()
+    cleaned_addr = clean_address(addr)
+    
+    items_str = str(raw.get("items","")).strip()
+    if not items_str or items_str == "nan": items_str = "Hàng tiêu chuẩn"
+
+    w = parse_qty(raw.get("total_weight_kg"))
+    v = parse_qty(raw.get("total_volume_m3"), dot_is_decimal=True)
+
+    # ---------------------------------------------------------------------
+    # LOGIC TỰ ĐỘNG TÍNH THỂ TÍCH & TRỌNG LƯỢNG TỪ TAB PRODUCT
+    # Thể tích = (thể tích cm3 từ Product * quantity) / 1.000.000
+    # ---------------------------------------------------------------------
+    if product_lookup and items_str in product_lookup:
+        p_info = product_lookup[items_str]
+        p_vol_cm3 = float(p_info.get("volume", 0.0))
+        p_weight  = float(p_info.get("weight", 0.0))
+        
+        if p_vol_cm3 > 0:
+            v = (p_vol_cm3 * q) / 1_000_000.0
+        if p_weight > 0:
+            w = p_weight * q
+
     lat,lng,geo_status = None,None,"— Chưa quét"
     if do_geocode and cleaned_addr:
         geo = geocode_address(cleaned_addr)
         if geo["ok"]: lat,lng,geo_status = geo["lat"],geo["lng"],"✅ Thành công"
         else: geo_status = geo["status"]
-    items_str = str(raw.get("items","")).strip()
-    if not items_str or items_str == "nan": items_str = "Hàng tiêu chuẩn"
+
     return {
         "order_id":     str(raw.get("order_id","")),
         "customer_id":  str(raw.get("customer_id","")),
         "customer_name":cust_name,
-        "quantity":     int(q or 1),
+        "quantity":     int(q),
         "items":        items_str,
         "total_weight_kg": round(w or 0.0,4),
         "total_volume_m3": round(v or 0.0,6),
@@ -683,9 +719,9 @@ def render_orders_tab():
         "order_id":       ["ORD_001","ORD_002","ORD_003"],
         "customer_name":  ["Công ty A","Nguyễn Văn B","Trần Văn C"],
         "quantity":       [10,5,12],
-        "items":          ["Bàn ghế văn phòng","Tủ lạnh 2 cánh","Sofa góc"],
+        "items":          ["P011","P008","P022"],
         "total_weight_kg":[150.0,85.0,210.0],
-        "total_volume_m3":[1.2,0.8,2.5],
+        "total_volume_m3":[0.0,0.0,0.0],
         "shift":          ["Ca Sáng","Ca Chiều","Ca Sáng"],
         "address":        ["Số 1 Tràng Tiền, Hà Nội","123 Cầu Giấy, Hà Nội","Thành phố Bắc Ninh, Bắc Ninh"],
     })
@@ -706,11 +742,15 @@ def render_orders_tab():
     chosen = render_mapping("orders",FIELDS,raw)
     if st.button("🚀 Chuẩn hóa & Quét Tọa độ Đơn hàng",key="orders_process",type="primary"):
         colmap = build_colmap(raw, chosen)
+        prod_lookup = load_product_lookup()
         rows   = []
-        with st.spinner("Đang chuẩn hóa & quét ArcGIS Geocoding địa chỉ đơn hàng..."):
+        with st.spinner("Đang chuẩn hóa, tra cứu sản phẩm & quét ArcGIS Geocoding địa chỉ..."):
             for _, row in raw.iterrows():
                 rows.append(process_order_with_geocode(
-                    {f: row.get(c) for f,c in colmap.items()},do_geocode=do_geo))
+                    {f: row.get(c) for f,c in colmap.items()},
+                    do_geocode=do_geo,
+                    product_lookup=prod_lookup
+                ))
         out   = orders_validate_output(pd.DataFrame(rows))
         files = save_outputs(OUT_ORDERS,"DIM_ORDERS","DIM_ORDERS",out)
         mask_failed = out["trạng_thái_geocode"] != "✅ Thành công"
@@ -852,7 +892,7 @@ def classify_outsourcing(excess_w, excess_v, oc=None, force_full=False) -> dict:
         if w < oc["tier2_max_w"] and v < oc["tier2_max_v"]:
             return {"type":"Tiết kiệm loại 2","tier":"SAVING_2","cost":float(oc["saving_2_price"]),
                     "trips":1,"vehicle":"Tiết kiệm loại 2",
-                    "cap_w":float(oc["tier2_max_w"]),"cap_v":float(oc["tier2_max_v"]),
+                    "cap_w":float(oc["tier2_max_w Cor"] if "tier2_max_w Cor" in oc else oc["tier2_max_w"]),"cap_v":float(oc["tier2_max_v"]),
                     "why":f"tải {w:.1f}kg<{oc['tier2_max_w']:g}kg, {v:.2f}m³<{oc['tier2_max_v']:g}m³"}
         if w <= oc["tier1_max_w"] and v <= oc["tier1_max_v"]:
             return {"type":"Tiết kiệm loại 1","tier":"SAVING_1","cost":float(oc["saving_1_price"]),
@@ -1087,16 +1127,11 @@ def _fetch_osrm_matrix_cached(point_ids: tuple, coords_flat: tuple) -> dict:
 
 def build_osrm_matrix(warehouses: dict, customers: dict,
                       orders: list = None) -> tuple[dict, str]:
-    """
-    Build real-road distance matrix using OSRM Table API.
-    Returns (matrix_dict, status_msg).
-    Falls back to haversine (empty dict) when unavailable.
-    """
     all_custs = dict(customers)
     for o in (orders or []):
         cid = o.get("customer_id")
         if cid and o.get("lat") and o.get("lng") and cid not in all_custs:
-            all_custs[cid] = {"lat":float(o["lat"]),"lng":float(o["lng"]),"name":cid}
+            all_custs[cid] = {"lat":float(o["lat Corbin"] if "lat Corbin" in o else o["lat"]),"lng":float(o["lng"]),"name":cid}
     ids    = list(warehouses.keys())
     coords = [(v["lat"],v["lng"]) for v in warehouses.values()]
     for cid,c in all_custs.items():
@@ -1147,7 +1182,6 @@ class RoutePlanner:
             lst.sort(key=lambda r:(r["max_weight_kg"],r["max_volume_m3"]))
 
     def _dist(self, id_a: str, a: dict, id_b: str, b: dict) -> float:
-        """OSRM if available, else Haversine × detour."""
         key = (id_a, id_b)
         if key in self.osrm_matrix:
             return self.osrm_matrix[key]
@@ -1471,7 +1505,6 @@ def _route_total(r):
 # 🗺️ TAB 6: ROUTING — HELPER FUNCTIONS
 # ============================================================================
 def _mins(time_str: str) -> int:
-    """Convert HH:MM to total minutes."""
     try:
         h,m = map(int, time_str.strip().split(":"))
         return h*60+m
@@ -1970,17 +2003,17 @@ def handle_route6_full(order_id,*a):
 def handle_no_backup_vehicle(*a):
     return f"[{dt.datetime.now():%H:%M:%S}] 🚚 [NO BACKUP FLEET] Hết xe dự phòng. Quét xe đang chạy còn trống để ghép đơn (Co-loading)."
 def handle_route7_overload(*a):
-    return f"[{dt.datetime.now():%H:%M:%S}] ⚠️ [CASCADE OVERLOAD] Chuyển đơn làm tuyến kế gãy tải. Hủy phương án, tính thuê ngoài."
+    return f"[{dt.datetime.now():%H:%M:%S}] ⚠️ [CASCADE OVERLOAD] Chuyển đơn làm tuyến kế quá tải. Hủy phương án, tính thuê ngoài."
 def handle_cost_too_high(*a):
     return f"[{dt.datetime.now():%H:%M:%S}] 💰 [COST EXCEEDED] Chi phí quá cao. So sánh chi phí đền bù trễ vs thuê ngoài."
 def handle_driver_timeout(order_id,vehicle_id,driver_id):
     return f"[{dt.datetime.now():%H:%M:%S}] ⏳ [MAX HOURS REACHED] Tài xế `{driver_id}` sắp hết giờ. Điều xe đổi ca/bàn giao phần đơn còn lại."
 def handle_area_mismatch(*a):
-    return f"[{dt.datetime.now():%H:%M:%S}] 🧭 [AREA MISMATCH] Xe còn chỗ nhưng lệch vùng. Khóa ghép đơn nếu deadhead > 10km."
+    return f"[{dt.datetime.now():%H:%M:%S}] 🧭 [AREA MISMATCH] Xe còn chỗ nhưng lệch khu vực. Khóa ghép đơn nếu deadhead > 10km."
 def handle_no_feasible_eta(*a):
     return f"[{dt.datetime.now():%H:%M:%S}] 🚨 [ETA IMPOSSIBLE] Không phương án nào kịp giờ. Cảnh báo tổng đài đàm phán lại khung giờ."
 def handle_redelivery_cost_limit(*a):
-    return f"[{dt.datetime.now():%H:%M:%S}] 🛑 [REDELIVERY COST CEILING] Chi phí giao lại vượt giá trị đơn. Chuyển về bưu cục gần nhất."
+    return f"[{dt.datetime.now():%H:%M:%S}] 🛑 [REDELIVERY COST CEILING] Chi phí giao lại vượt ngưỡng. Chuyển về bưu cục gần nhất."
 def handle_map_data_conflict(*a):
     return f"[{dt.datetime.now():%H:%M:%S}] 🧐 [DATA CONFLICT] Xung đột GIS vs báo thực địa. Yêu cầu tài xế gửi ảnh xác minh."
 def handle_duplicate_assignment(order_id,*a):
