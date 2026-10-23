@@ -20,13 +20,11 @@ from unidecode import unidecode
 # ⚙️ 1. MÀN HÌNH & TỔNG QUAN HỆ THỐNG
 # ============================================================================
 st.set_page_config(page_title="Smart Logistics Dashboard", page_icon="🚚", layout="wide")
-
 NONE = "-- Không sử dụng --"
 INPUT_MODES = ["Nhập trực tiếp (Data Editor)", "Upload file Excel/CSV/JSON"]
 UPLOAD_TYPES = ["xlsx", "xls", "xlsm", "csv", "json"]
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 VIETNAM_BOUNDS = (8.0, 24.5, 102.0, 110.0)
-
 BASE_DIR = os.getcwd()
 OUT_FLEET     = os.path.join(BASE_DIR, "output_fleet")
 OUT_WAREHOUSE = os.path.join(BASE_DIR, "output_warehouse")
@@ -587,10 +585,8 @@ _ORDER_RAW = {
 }
 ORDER_FIELDS = {f: dict(label=f,aliases=[f]+v["aliases"]) for f,v in _ORDER_RAW.items()}
 FIELDS = list(ORDER_FIELDS)
-
 TYPE_TABLE  = {"B2C":["b2c","cá nhân","lẻ"], "B2B":["b2b","doanh nghiệp","sỉ"]}
 ALERT_TABLE = {"Alert":["alert","khẩn","gấp"], "Normal":["normal","bình thường"]}
-
 SHIFT_MAPPING_KEYWORDS = {
     "Ca Sáng": ["sáng","ca sáng","morning","ca 1","am","shift 1"],
     "Ca Chiều": ["chiều","ca chiều","afternoon","ca 2","pm","shift 2"],
@@ -947,6 +943,7 @@ class Config:
     order_file:    str = os.path.join(OUT_ORDERS,   "DIM_ORDERS.xlsx")
     cust_file:     str = os.path.join(OUT_CUSTOMER, "DATASET_CUSTOMER.xlsx")
     matrix_file:   str = os.path.join(OUT_MATRIX,   "DISTANCE_MATRIX_KM.xlsx")
+
     @property
     def outsourcing(self) -> dict:
         return {k: OC_DEFAULTS[k] for k in OC_DEFAULTS}
@@ -1100,23 +1097,19 @@ def build_osrm_matrix(warehouses: dict, customers: dict,
         cid = o.get("customer_id")
         if cid and o.get("lat") and o.get("lng") and cid not in all_custs:
             all_custs[cid] = {"lat":float(o["lat"]),"lng":float(o["lng"]),"name":cid}
-
     ids    = list(warehouses.keys())
     coords = [(v["lat"],v["lng"]) for v in warehouses.values()]
     for cid,c in all_custs.items():
         if c.get("lat") and c.get("lng"):
             ids.append(cid)
             coords.append((c["lat"],c["lng"]))
-
     if len(ids) < 2:
         return {}, "⚠️ Không đủ điểm để xây dựng ma trận OSRM."
     if len(ids) > MAX_OSRM_POINTS:
         return {}, (f"⚠️ Quá nhiều điểm ({len(ids)} > {MAX_OSRM_POINTS}). "
                     f"Dùng Haversine × detour_factor thay thế.")
-
     flat   = tuple(v for lat,lng in coords for v in (lat,lng))
     matrix = _fetch_osrm_matrix_cached(tuple(ids), flat)
-
     if not matrix:
         return {}, "❌ OSRM không phản hồi hoặc lỗi. Dùng Haversine thay thế."
     return matrix, (f"✅ Ma trận OSRM: {len(ids)} điểm — "
@@ -1134,7 +1127,6 @@ class RoutePlanner:
         self.wh   = data["warehouses"]
         self.detour    = cfg.detour_factor
         self.max_hours = calculate_effective_max_hours(cfg.start_time, cfg.max_route_hours)
-
         if self.veh.empty:
             self.catalog = pd.DataFrame(columns=["w","v","speed","fixed","var","dist"])
         else:
@@ -1154,7 +1146,6 @@ class RoutePlanner:
         for lst in self._fleet.values():
             lst.sort(key=lambda r:(r["max_weight_kg"],r["max_volume_m3"]))
 
-    # ── distance helpers ────────────────────────────────────────────────────
     def _dist(self, id_a: str, a: dict, id_b: str, b: dict) -> float:
         """OSRM if available, else Haversine × detour."""
         key = (id_a, id_b)
@@ -1302,10 +1293,10 @@ class RoutePlanner:
     def _calculate_load_factor(self, m, vrow, cls):
         mode = getattr(self.cfg,"constraint_mode","Cube Out (Thể tích m³)")
         if "Cube Out" in mode:
-            cap_v = float(vrow["max_volume_m3"]) if vrow else float(cls.get("cap_v",40.0))
+            cap_v = float(vrow["max_volume_m3"]) if vrow is not None else float(cls.get("cap_v",40.0))
             return min(m["v"]/cap_v,1.0) if cap_v>0 else 0.0
         else:
-            cap_w = float(vrow["max_weight_kg"]) if vrow else float(cls.get("cap_w",10000.0))
+            cap_w = float(vrow["max_weight_kg"]) if vrow is not None else float(cls.get("cap_w",10000.0))
             return min(m["w"]/cap_w,1.0) if cap_w>0 else 0.0
 
     def _outsource_route(self, custs, wh_id, demand, by_cust,
@@ -1380,7 +1371,7 @@ class RoutePlanner:
                 r   = self.two_opt([x for x in r if x!=c],wh_id)
                 continue
             final = (m,ta,action,vid,vrow,
-                     tb if (vrow and not bad) else None, start_str)
+                     tb if (vrow is not None and not bad) else None, start_str)
             break
         for v_,n_ in blocked.items(): veh_counts[v_] = n_
         out = []
@@ -1489,14 +1480,8 @@ def _mins(time_str: str) -> int:
 
 def plan_by_shifts(data: dict, cfg: Config,
                    cfg_shifts: list, osrm_matrix: dict = None) -> dict:
-    """
-    Run Clarke-Wright independently for each configured shift per day.
-    Returns: {date_str: {"tagged_all": [...], "shifts": {shift_name: {...}}, "exceptions": [...]}}
-    """
     if not cfg_shifts:
         cfg_shifts = [{"name":"Ca 1","start":"06:00","end":"17:30"}]
-
-    # Build timing map
     shift_timing = {}
     for s in cfg_shifts:
         try:
@@ -1508,30 +1493,22 @@ def plan_by_shifts(data: dict, cfg: Config,
             }
         except Exception:
             shift_timing[s["name"]] = {"start":"06:00","max_hours":8.0}
-
     default_shift = cfg_shifts[0]["name"]
-
     by_date: dict = {}
     for o in data["orders"]:
         by_date.setdefault(o["order_date"],[]).append(o)
-
     all_day_results: dict = {}
-
     for date_str in sorted(by_date):
         date_orders = by_date[date_str]
-
-        # Group by shift
         shift_groups: dict = {}
         for o in date_orders:
             sname = o.get("shift", default_shift)
             if sname not in shift_timing:
                 sname = default_shift
             shift_groups.setdefault(sname,[]).append(o)
-
         tagged_all: list  = []
         shift_results: dict = {}
         all_exceptions: list = []
-
         for sname in [s["name"] for s in cfg_shifts]:
             s_orders = shift_groups.get(sname, [])
             if not s_orders:
@@ -1553,42 +1530,28 @@ def plan_by_shifts(data: dict, cfg: Config,
             )
             planner = RoutePlanner(data, shift_cfg, osrm_matrix=osrm_matrix or {})
             day     = planner.plan_day(date_str, s_orders)
-
             for r in day["routes"] + day.get("overdue_routes",[]):
                 r["shift_name"] = sname
-
             shift_results[sname] = {"day":day,"planner":planner}
             tagged_all += [(r,"Thường") for r in day["routes"]]
             tagged_all += [(r,"Quá hạn") for r in day.get("overdue_routes",[])]
             all_exceptions.extend(day.get("exceptions",[]))
-
         all_day_results[date_str] = {
             "tagged_all":    tagged_all,
             "shifts":        shift_results,
             "exceptions":    all_exceptions,
         }
-
     return all_day_results
 
-
 def build_routing_result_tables(tagged_all: list) -> tuple:
-    """
-    Split routing results into 3 DataFrames:
-      1. df_inhouse   – xe nhà tối ưu thành công (NORMAL + SPLIT)
-      2. df_full_3pl  – đơn cần 3PL Full (listed individually)
-      3. df_saving    – đơn giao hàng tiết kiệm (listed individually)
-    """
     inhouse_rows: list = []
     full_3pl_rows: list = []
     saving_rows: list   = []
-
     for idx,(r,kind) in enumerate(tagged_all, 1):
         vid        = str(r.get("vehicle_id","") or "")
         shift_name = r.get("shift_name","")
         orders     = r.get("orders",[])
-
         if r["external"]:
-            # Classify by tier in vehicle_id string: "3PL-FULL", "3PL-SAVING_1", "3PL-SAVING_2"
             is_full = vid.startswith("3PL-FULL") or "full" in str(r.get("outsourcing_type","")).lower()
             for o in orders:
                 row = {
@@ -1608,7 +1571,6 @@ def build_routing_result_tables(tagged_all: list) -> tuple:
                 else:
                     saving_rows.append(row)
         else:
-            # In-house (NORMAL or SPLIT)
             split_note = ""
             if r.get("kind") == "SPLIT":
                 split_note = f" [+3PL phần dư: {r.get('outsourcing_type','')}]"
@@ -1654,23 +1616,15 @@ def build_routing_result_tables(tagged_all: list) -> tuple:
                 "Dự kiến về":         f"{r['end']:%H:%M}"   if r.get("end")   else "",
                 "Trạng thái":         "🟠 Tách tuyến + 3PL" if r.get("kind")=="SPLIT" else "✅ Tối ưu thành công",
             })
-
     return (pd.DataFrame(inhouse_rows),
             pd.DataFrame(full_3pl_rows),
             pd.DataFrame(saving_rows))
 
-
 def render_phan_ca_section(tagged_all: list, split_time_str: str, cfg_shifts: list):
-    """
-    At split_time, show which in-house vehicles have completed all their routes
-    (available for next shift) vs. still running (unaffected).
-    """
     st.markdown(f"### 🔄 Chốt Hạm Đội Tại Giờ Phân Ca: **{split_time_str}**")
     split_min = _mins(split_time_str)
     if split_min == 0:
         st.error("Giờ phân ca không hợp lệ (định dạng HH:MM)"); return
-
-    # Collect in-house vehicle route info
     veh_info: dict = {}
     for r,_ in tagged_all:
         if r["external"]: continue
@@ -1684,10 +1638,8 @@ def render_phan_ca_section(tagged_all: list, split_time_str: str, cfg_shifts: li
                 "routes":        [],
             }
         veh_info[vid]["routes"].append(r)
-
     completed: list = []
     still_running: list = []
-
     for vid,info in veh_info.items():
         routes = info["routes"]
         valid_ends = [r["end"] for r in routes if r.get("end")]
@@ -1715,19 +1667,15 @@ def render_phan_ca_section(tagged_all: list, split_time_str: str, cfg_shifts: li
             remaining = end_min - split_min
             row["Trạng thái"] = f"🚚 Đang chạy (còn ~{remaining} phút)"
             still_running.append(row)
-
-    # Find next shift after split_time
     next_shift = None
     for s in cfg_shifts:
         if _mins(s.get("start","00:00")) > split_min:
             next_shift = s; break
-
     mc1,mc2,mc3 = st.columns(3)
     mc1.metric("✅ Xe đã về kho tại giờ phân ca", len(completed))
     mc2.metric("🚚 Xe đang chạy (không liên quan)", len(still_running))
     if next_shift:
         mc3.info(f"🚀 Ca tiếp theo: **{next_shift['name']}** — Xuất phát **{next_shift['start']}**")
-
     tab_done, tab_run = st.tabs([
         f"✅ Xe sẵn sàng ca tiếp ({len(completed)} xe)",
         f"🚚 Xe đang chạy — không tính vào ca tiếp ({len(still_running)} xe)",
@@ -1743,26 +1691,16 @@ def render_phan_ca_section(tagged_all: list, split_time_str: str, cfg_shifts: li
         if still_running:
             st.dataframe(pd.DataFrame(still_running),hide_index=True,use_container_width=True)
             st.caption("ℹ️ Các xe này vẫn đang trên đường, không tính vào hạm đội ca tiếp.")
-        else:
-            st.info("Tất cả xe đều đã về kho trước giờ phân ca.")
 
 # ============================================================================
 # 🗺️ TAB 6: ROUTING — SETTINGS UI
 # ============================================================================
 def render_routing_settings():
-    """
-    Returns (cfg, cfg_shifts, split_time_str).
-    Replaces old start_time input with multi-shift config + giờ phân ca.
-    """
     with st.expander("⚙️ Cấu hình Ca Giao Hàng & Tham số Mô hình", expanded=True):
-
-        # ── Shift count buttons ──────────────────────────────────────────
         if "shift_count" not in st.session_state:
             st.session_state["shift_count"] = 2
-
         st.markdown("**🕐 Cấu hình ca giao hàng trong ngày:**")
         st.caption("Tên ca phải trùng khớp với trường 'Shift' trong dữ liệu Đơn hàng (Tab 4).")
-
         btn1,btn2,_,split_col = st.columns([1.3,1.3,2.5,2.5])
         if btn1.button("➕ Thêm ca", key="btn_add_shift"):
             if st.session_state["shift_count"] < 6:
@@ -1776,23 +1714,18 @@ def render_routing_settings():
             "🔄 Giờ phân ca (HH:MM)",value="12:00",key="cfg_split_time",
             help="Tại giờ này xe đã về kho sẽ được tập kết chuẩn bị ca tiếp theo. "
                  "Xe chưa về cứ để chạy, không liên quan.")
-
-        # ── Shift table ──────────────────────────────────────────────────
         _DEFAULTS = [
             ("Ca Sáng","06:00","12:00"),
             ("Ca Chiều","13:00","17:30"),
             ("Ca Đêm","18:00","22:00"),
         ]
         n = st.session_state["shift_count"]
-
         h0,h1,h2,h3 = st.columns([0.4,2.4,1.5,1.5])
         h0.caption("**#**"); h1.caption("**Tên ca**")
         h2.caption("**Bắt đầu**"); h3.caption("**Kết thúc**")
-
         cfg_shifts = []
         for i in range(n):
             dn,ds,de = _DEFAULTS[i] if i < len(_DEFAULTS) else (f"Ca {i+1}","08:00","17:00")
-            # Initialise session_state defaults only once
             for key,val in [(f"sh_name_{i}",dn),(f"sh_start_{i}",ds),(f"sh_end_{i}",de)]:
                 if key not in st.session_state:
                     st.session_state[key] = val
@@ -1802,10 +1735,7 @@ def render_routing_settings():
             start = c2.text_input(f"start_{i}", key=f"sh_start_{i}", label_visibility="collapsed")
             end   = c3.text_input(f"end_{i}",   key=f"sh_end_{i}",   label_visibility="collapsed")
             cfg_shifts.append({"name":name,"start":start,"end":end})
-
         st.divider()
-
-        # ── Other routing params ─────────────────────────────────────────
         c_mode,c1,c2 = st.columns(3)
         constraint_mode = c_mode.selectbox(
             "📦 Đặc thù hàng hóa (Lấp đầy theo)",
@@ -1814,15 +1744,13 @@ def render_routing_settings():
         detour = c1.number_input("Hệ số đường vòng (nếu dùng Haversine)",
                                  1.0,3.0,1.2,0.05,key="cfg_detour")
         trips  = c2.number_input("Số chuyến tối đa / xe / ngày",1,5,2,1,key="cfg_trips")
-
         c3,c4,c5 = st.columns(3)
         svc_b2b = c3.number_input("Bốc/dỡ B2B (phút)",0,600,105,5,key="cfg_b2b")
         svc_b2c = c4.number_input("Bốc/dỡ B2C (phút)",0,600,60,5, key="cfg_b2c")
         turn    = c5.number_input("Quay đầu giữa 2 chuyến (phút)",0,240,30,5,key="cfg_turn")
-
     cfg = Config(
         start_time          = cfg_shifts[0]["start"] if cfg_shifts else "06:00",
-        max_route_hours     = 8.0,      # overridden per shift in plan_by_shifts
+        max_route_hours     = 8.0,
         detour_factor       = float(detour),
         constraint_mode     = constraint_mode,
         service_min         = {"B2B":int(svc_b2b),"B2C":int(svc_b2c)},
@@ -1830,7 +1758,6 @@ def render_routing_settings():
         turnaround_min      = float(turn),
     )
     return cfg, cfg_shifts, split_time
-
 
 def file_status(cfg: Config) -> pd.DataFrame:
     items = [
@@ -1856,23 +1783,18 @@ def require_files(cfg: Config, which):
 # ============================================================================
 def render_routing_tab():
     st.header("🗺️ Dashboard Định tuyến — Clarke-Wright + OpenStreetMap (OSRM)")
-
     cfg, cfg_shifts, split_time = render_routing_settings()
-
     st.markdown("### 📂 Trạng thái dữ liệu đầu vào")
     st.dataframe(file_status(cfg), hide_index=True)
-
     use_osrm = st.checkbox(
         "🗺️ Lấy ma trận khoảng cách đường thực từ OpenStreetMap (OSRM)",
         value=True, key="use_osrm",
         help=f"Dùng OSRM public API (tối đa {MAX_OSRM_POINTS} điểm). "
              f"Nếu vượt hoặc lỗi, tự động fallback về Haversine × hệ số đường vòng.")
-
     if st.button("⚡ Chạy Routing", type="primary", key="t6_run"):
         try:
             require_files(cfg, ["orders","fleet"])
             data = load_data(cfg)
-
             osrm_matrix: dict = {}
             if use_osrm:
                 with st.spinner("🗺️ Đang lấy ma trận khoảng cách từ OSRM / OpenStreetMap..."):
@@ -1882,10 +1804,8 @@ def render_routing_tab():
                     st.success(osrm_msg)
                 else:
                     st.warning(f"{osrm_msg} — Tự động dùng Haversine × {cfg.detour_factor}.")
-
             with st.spinner("⚙️ Đang tối ưu tuyến theo ca (Clarke-Wright)..."):
                 day_results = plan_by_shifts(data, cfg, cfg_shifts, osrm_matrix)
-
             st.session_state["t6_plan"] = {
                 "day_results": day_results,
                 "cfg":         cfg,
@@ -1895,41 +1815,31 @@ def render_routing_tab():
             }
             n_routes = sum(len(dr["tagged_all"]) for dr in day_results.values())
             st.success(f"✅ Routing hoàn tất! {n_routes} tuyến trên {len(day_results)} ngày.")
-
         except UserError as e:
             st.error(f"❌ {e}")
         except Exception as e:
             st.error(f"❌ Lỗi không mong đợi: {e}")
             raise
 
-    # ── Results ─────────────────────────────────────────────────────────────
     plan = st.session_state.get("t6_plan")
     if not plan:
         return
-
     day_results = plan["day_results"]
     cfg         = plan["cfg"]
     cfg_shifts  = plan["cfg_shifts"]
     split_time  = plan["split_time"]
-
     dates = list(day_results.keys())
     if not dates:
         st.warning("Không có ngày nào có đơn hàng trong dữ liệu.")
         return
-
     date_str   = st.selectbox("📅 Chọn ngày điều phối", dates, key="t6_date")
     tagged_all = day_results[date_str]["tagged_all"]
-
     if not tagged_all:
         st.info("Không có tuyến nào được tạo cho ngày này.")
         return
-
     df_inhouse, df_full_3pl, df_saving = build_routing_result_tables(tagged_all)
-
     st.divider()
     st.markdown(f"## 📊 Kết Quả Routing — {date_str}")
-
-    # Summary KPIs
     total_orders   = sum(len(r["orders"])  for r,_ in tagged_all)
     n_inhouse      = len(df_inhouse)
     n_3pl          = len(df_full_3pl)
@@ -1937,7 +1847,6 @@ def render_routing_tab():
     unrouted       = day_results[date_str].get("shifts",{})
     n_unrouted     = sum(len(sr["day"].get("unrouted_orders",[]))
                          for sr in unrouted.values())
-
     k1,k2,k3,k4,k5 = st.columns(5)
     k1.metric("Tổng đơn trong ngày",       total_orders)
     k2.metric("✅ Tuyến xe nhà tối ưu",     f"{n_inhouse} tuyến")
@@ -1945,13 +1854,11 @@ def render_routing_tab():
     k4.metric("🛵 Đơn giao hàng tiết kiệm", f"{n_saving} đơn")
     k5.metric("❓ Đơn chưa geocode",         f"{n_unrouted} đơn")
 
-    # ── 3 result tabs ───────────────────────────────────────────────────────
     tab1, tab2, tab3 = st.tabs([
         f"✅ Tuyến xe nhà tối ưu ({n_inhouse} tuyến)",
         f"🚛 Đơn cần 3PL Full ({n_3pl} đơn)",
         f"🛵 Đơn giao hàng tiết kiệm ({n_saving} đơn)",
     ])
-
     with tab1:
         st.markdown("##### Các tuyến được Clarke-Wright tối ưu thành công — xe nhà phụ trách")
         if df_inhouse.empty:
@@ -1966,7 +1873,6 @@ def render_routing_tab():
                                mime=XLSX_MIME, key="dl_inhouse")
             save_outputs(OUT_ROUTING, f"ROUTES_INHOUSE_{date_str}",
                          "Tuyến Tối Ưu", df_inhouse)
-
     with tab2:
         st.markdown("##### Đơn hàng vượt khả năng hạm đội xe nhà — cần liên hệ đối tác 3PL Full")
         st.caption("ℹ️ Chỉ liệt kê danh sách đơn hàng. Phân tuyến 3PL do đội vận hành quyết định.")
@@ -1982,7 +1888,6 @@ def render_routing_tab():
                                mime=XLSX_MIME, key="dl_3pl")
             save_outputs(OUT_ROUTING, f"ORDERS_3PL_FULL_{date_str}",
                          "Đơn 3PL Full", df_full_3pl)
-
     with tab3:
         st.markdown("##### Đơn hàng đủ điều kiện dùng dịch vụ giao hàng tiết kiệm")
         st.caption("ℹ️ Chỉ liệt kê danh sách đơn hàng. Không tính số tuyến hay chi phí.")
@@ -1998,19 +1903,12 @@ def render_routing_tab():
                                mime=XLSX_MIME, key="dl_saving")
             save_outputs(OUT_ROUTING, f"ORDERS_SAVING_{date_str}",
                          "Đơn Tiết Kiệm", df_saving)
-
     st.divider()
-
-    # ── Giờ phân ca ─────────────────────────────────────────────────────────
     render_phan_ca_section(tagged_all, split_time, cfg_shifts)
-
-    # ── Routing exceptions log ───────────────────────────────────────────────
     all_exc = day_results[date_str].get("exceptions",[])
     if all_exc:
         with st.expander(f"⚠️ Nhật ký sự kiện routing ({len(all_exc)} sự kiện)", expanded=False):
             st.dataframe(pd.DataFrame(all_exc), hide_index=True, use_container_width=True)
-
-    # ── Notes from data loading ──────────────────────────────────────────────
     notes = plan["data"].get("notes",[])
     if notes:
         with st.expander("📝 Ghi chú tải dữ liệu", expanded=False):
